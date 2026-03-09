@@ -1,0 +1,10 @@
+.venv
+PanopTILs_data/*
+.claude
+PanopTILs_data
+__pycache__/
+*.pyc
+.env
+azure/azure_config.json
+azure
+.amlignore

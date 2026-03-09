@@ -1,0 +1,71 @@
+
+data:
+  root: "PanopTILs_data/BootstrapNucleiManualRegions_TCGA_05132021"
+  subset: "tcga"
+  batch_size: 16  
+  num_workers: 10  
+  cache_dataset: true
+  pin_memory: true
+  persistent_workers: true
+
+  use_weighted_sampler: true
+  gamma_s: 0.5
+
+splits:
+  fold: 1
+
+model:
+  num_nuclei_classes: 10
+  num_tissue_classes: 9
+  nuclei_unlabeled_class: 0  
+  nuclei_background_class: 9 
+  embed_dim: 384
+  depth: 12
+  num_heads: 6
+  extract_layers: [3, 6, 9, 12]
+  encoder_pretrained: "weights/vit256_small_dino.pth"
+
+loss:
+  # binary branch
+  lambda_np_ft: 1.0
+  lambda_np_dice: 1.0
+
+  # HV map branch
+  lambda_hv_mse: 2.5
+  lambda_hv_msge: 8.0
+
+  # nuclear type branch  
+  lambda_nt_ft: 0.5
+  lambda_nt_dice: 0.2
+  lambda_nt_bce: 0.5
+
+  # tissue classification branch
+  lambda_tc_ce: 0.0
+
+  # Focal Tversky hyperparameters
+  ft_alpha: 0.7
+  ft_beta: 0.3
+  ft_gamma: 1.3333   # 4/3
+  ft_eps: 1.0e-6
+
+train:
+  lr: 0.0003          
+  wd: 0.0001           # weight decay
+  betas: [0.85, 0.85]  # Adam betas 
+
+  epochs: 130
+
+  scheduler_type: exponential
+  # scheduler_eta_min: 0.000005
+  scheduler_gamma: 0.85  # for exponential scheduler
+
+  use_mixed_precision: true
+
+  gradient_accumulation_steps: 1  
+  max_grad_norm: 1.0
+
+  freeze_encoder_epochs: 25
+
+  val_metric_interval: 10
+
+  # early_stopping_patience: 15
