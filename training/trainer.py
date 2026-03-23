@@ -82,7 +82,7 @@ class Trainer:
         )
 
         if early_stopping_patience is not None:
-            self.early_stopping = EarlyStopping(patience=early_stopping_patience, mode="max")
+            self.early_stopping = EarlyStopping(patience=early_stopping_patience, mode="min")
         else:
             self.early_stopping = None
 
@@ -349,9 +349,7 @@ class Trainer:
     def check_early_stopping(self, val_metrics: Dict[str, float]) -> bool:
         if self.early_stopping is None:
             return False
-        if 'pq' not in val_metrics:
-            return False
-        return self.early_stopping.step(val_metrics['pq'])
+        return self.early_stopping.step(val_metrics['loss'])
 
     def save_checkpoint(self, path: str, epoch: int, val_metrics: Dict[str, float]):
         checkpoint = {

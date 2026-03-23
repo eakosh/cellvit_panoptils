@@ -9,10 +9,10 @@ data:
   persistent_workers: true
 
   use_weighted_sampler: true
-  gamma_s: 0.5
+  gamma_s: 1.5
 
 splits:
-  fold: 1
+  fold: 5
 
 model:
   num_nuclei_classes: 10
@@ -34,30 +34,29 @@ loss:
   lambda_hv_mse: 2.5
   lambda_hv_msge: 8.0
 
-  # nuclear type branch  
-  lambda_nt_ft: 0.5
-  lambda_nt_dice: 0.2
-  lambda_nt_bce: 0.5
+  # nuclear type branch
+  lambda_nt_ft: 1.0
+  lambda_nt_dice: 0.5
+  lambda_nt_bce: 1.0
 
   # tissue classification branch
   lambda_tc_ce: 0.0
 
   # Focal Tversky hyperparameters
-  ft_alpha: 0.7
-  ft_beta: 0.3
+  ft_alpha: 0.4
+  ft_beta: 0.6
   ft_gamma: 1.3333   # 4/3
   ft_eps: 1.0e-6
 
 train:
-  lr: 0.0003          
+  lr: 0.0003
   wd: 0.0001           # weight decay
-  betas: [0.85, 0.85]  # Adam betas 
+  betas: [0.9, 0.999]  # Adam betas 
 
   epochs: 130
 
   scheduler_type: exponential
-  # scheduler_eta_min: 0.000005
-  scheduler_gamma: 0.85  # for exponential scheduler
+  scheduler_gamma: 0.95  
 
   use_mixed_precision: true
 
@@ -68,4 +67,4 @@ train:
 
   val_metric_interval: 10
 
-  # early_stopping_patience: 15
+  early_stopping_patience: 15

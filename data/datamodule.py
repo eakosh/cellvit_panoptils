@@ -1,5 +1,7 @@
+from collections import Counter
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Set
+import numpy as np
 from torch.utils.data import DataLoader
 
 from datasets.panoptils import PanopTILsDataset, PanopTILsPaths
@@ -21,7 +23,8 @@ class DataConfig:
     use_weighted_sampler: bool = True
     gamma_s: float = 0.85
     unlabeled_class: Optional[int] = None
-    background_nuclei_class: Optional[int] = None  
+    background_nuclei_class: Optional[int] = None
+    background_loss_weight: float = 0.3
 
 
 class PanopTILsDataModule:
@@ -54,30 +57,52 @@ class PanopTILsDataModule:
             unlabeled_class=self.cfg.unlabeled_class,
         )
 
+        self._patch_tissue_classes: List[int] = []
+        self._patch_nuclei_classes: List[Set[int]] = []
+        for f in self.train_ds.files:
+            meta = self.train_ds.meta[f]
+            self._patch_tissue_classes.extend(meta["patch_tissue_classes"])
+            self._patch_nuclei_classes.extend(meta["patch_classes"])
+
         self._train_loader = None
         self._val_loader = None
+
+    def nt_class_weights(self, num_nuclei_classes: int) -> List[float]:
+        unlabeled = self.cfg.unlabeled_class    
+        background = self.cfg.background_nuclei_class  
+        nucleus_classes = [c for c in range(num_nuclei_classes)
+                           if c != unlabeled and c != background]
+
+        counts = Counter()
+        for class_set in self._patch_nuclei_classes:
+            for c in class_set:
+                if c in nucleus_classes:
+                    counts[c] += 1
+
+        nonzero = [counts[c] for c in nucleus_classes if counts[c] > 0]
+        median_count = float(np.median(nonzero)) if nonzero else 1.0
+
+        weights = [0.0] * num_nuclei_classes
+        for c in nucleus_classes:
+            weights[c] = median_count / counts[c] if counts[c] > 0 else median_count
+        if background is not None:
+            weights[background] = self.cfg.background_loss_weight
+        return weights
 
     def train_dataloader(self):
         if self._train_loader is not None:
             return self._train_loader
 
         if self.cfg.use_weighted_sampler:
-            patch_tissue_classes = []
-            patch_nuclei_classes = []
-            for f in self.train_ds.files:
-                meta = self.train_ds.meta[f]
-                patch_tissue_classes.extend(meta["patch_tissue_classes"])
-                patch_nuclei_classes.extend(meta["patch_classes"])
-
             ignore: set = set()
             if self.cfg.unlabeled_class is not None:
-                ignore.add(self.cfg.unlabeled_class)       
+                ignore.add(self.cfg.unlabeled_class)
             if self.cfg.background_nuclei_class is not None:
-                ignore.add(self.cfg.background_nuclei_class)  
+                ignore.add(self.cfg.background_nuclei_class)
 
             weights = compute_sampling_weights(
-                patch_tissue_classes=patch_tissue_classes,
-                patch_nuclei_classes=patch_nuclei_classes,
+                patch_tissue_classes=self._patch_tissue_classes,
+                patch_nuclei_classes=self._patch_nuclei_classes,
                 gamma_s=self.cfg.gamma_s,
                 ignore_nuclei_classes=ignore,
             )

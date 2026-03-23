@@ -53,6 +53,26 @@ def load_vit_dino_pretrained(model, ckpt_path):
         print("Encoder weights loaded successfully")
 
 
+def _try_upload_checkpoint_to_datastore(local_path: Path, blob_path: str):
+    """upload checkpoint directly to Azure ML Datastore so retries can resume"""
+    try:
+        from azureml.core import Run
+        from azureml.core.datastore import Datastore
+        run = Run.get_context()
+        if getattr(run, 'id', 'OfflineRun') == 'OfflineRun':
+            return
+        ds = Datastore.get_default(run.experiment.workspace)
+        ds.upload_files(
+            files=[str(local_path)],
+            target_path=blob_path,
+            overwrite=True,
+            show_progress=False,
+        )
+        print(f"Checkpoint uploaded to datastore: {blob_path}/{local_path.name}")
+    except Exception as e:
+        print(f"[Warning] Datastore upload failed (non-fatal): {e}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/baseline.yaml",
@@ -63,6 +83,10 @@ def main():
                         help="Override encoder checkpoint path")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Resume from checkpoint")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override output directory for checkpoints")
+    parser.add_argument("--checkpoint-datastore-path", type=str, default=None,
+                        help="Blob path in default Datastore where checkpoints are uploaded each epoch")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -93,9 +117,12 @@ def main():
         print("GPU not detected, using CPU")
 
     # output directory for checkpoints
-    output_dir = Path("outputs") / f"fold_{cfg['splits']['fold']}"
+    if args.output_dir is not None:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = Path("outputs") / f"fold_{cfg['splits']['fold']}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Checkpoints will be saved to: {output_dir}")
+    print(f"Checkpoints will be saved to: {output_dir.resolve()}")
 
     cfg["data"]["unlabeled_class"] = cfg["model"].get("nuclei_unlabeled_class", None)
     cfg["data"]["background_nuclei_class"] = cfg["model"].get("nuclei_background_class", None)
@@ -150,6 +177,10 @@ def main():
 
     unlabeled_class = cfg["model"].get("nuclei_unlabeled_class", None)
     background_class = cfg["model"].get("nuclei_background_class", None)
+    num_nuclei_classes = cfg["model"]["num_nuclei_classes"]
+
+    nt_class_weights = dm.nt_class_weights(num_nuclei_classes)
+    print(f"NT class weights (inv-freq): {[f'{w:.3f}' for w in nt_class_weights]}")
 
     loss_cfg = cfg["loss"]
     loss_fn = CellViTMultiTaskLoss(
@@ -166,6 +197,7 @@ def main():
         ft_gamma=loss_cfg.get("ft_gamma", 4.0 / 3.0),
         ft_eps=loss_cfg.get("ft_eps", 1e-6),
         unlabeled_class=unlabeled_class,
+        nt_class_weights=nt_class_weights,
     )
     
     optim = torch.optim.AdamW(
@@ -207,12 +239,33 @@ def main():
     )
 
     start_epoch = 0
+    checkpoint_to_load = None
     if args.checkpoint and os.path.exists(args.checkpoint):
-        start_epoch = trainer.load_checkpoint(args.checkpoint)
+        checkpoint_to_load = args.checkpoint
+    else:
+        retry_ckpt = Path("./resume_checkpoint/latest_checkpoint.pth")
+        auto_ckpt = output_dir / "latest_checkpoint.pth"
+        if retry_ckpt.exists():
+            checkpoint_to_load = str(retry_ckpt)
+            print(f"Auto-detected retry checkpoint: {retry_ckpt}")
+        elif auto_ckpt.exists():
+            checkpoint_to_load = str(auto_ckpt)
+            print(f"Auto-detected checkpoint: {auto_ckpt}")
+
+    if checkpoint_to_load:
+        start_epoch = trainer.load_checkpoint(checkpoint_to_load)
         print(f"Resuming from epoch {start_epoch}")
+
+    wandb_id_file = output_dir / "wandb_run_id.txt"
+    wandb_run_id = None
+    if wandb_id_file.exists():
+        wandb_run_id = wandb_id_file.read_text().strip()
+        print(f"Resuming wandb run: {wandb_run_id}")
 
     wandb.init(
         project="cellvit-panoptils",
+        id=wandb_run_id,
+        resume="allow",
         config={
             "learning_rate": cfg["train"]["lr"],
             "weight_decay": cfg["train"]["wd"],
@@ -231,6 +284,8 @@ def main():
         },
         name=f"fold_{cfg['splits']['fold']}",
     )
+
+    wandb_id_file.write_text(wandb.run.id)
 
     best_pq = 0.0
     best_epoch = 0
@@ -254,6 +309,12 @@ def main():
 
         # train
         train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
+
+        # reset early stopping counter when encoder unfreezes
+        freeze_encoder_epochs = cfg["train"].get("freeze_encoder_epochs", 25)
+        if epoch == freeze_encoder_epochs and trainer.early_stopping is not None:
+            trainer.early_stopping.counter = 0
+            print(f"Early stopping counter reset after encoder unfreeze at epoch {epoch}")
 
         # validate
         is_last_epoch = (epoch == cfg["train"]["epochs"] - 1)
@@ -298,12 +359,16 @@ def main():
         latest_path = output_dir / "latest_checkpoint.pth"
         trainer.save_checkpoint(str(latest_path), epoch, val_metrics)
 
-        if 'pq' in val_metrics and val_metrics['pq'] > best_pq:
-            best_pq = val_metrics['pq']
+        if args.checkpoint_datastore_path:
+            _try_upload_checkpoint_to_datastore(latest_path, args.checkpoint_datastore_path)
+
+        pq_key = 'pq_class_avg' if 'pq_class_avg' in val_metrics else 'pq'
+        if pq_key in val_metrics and val_metrics[pq_key] > best_pq:
+            best_pq = val_metrics[pq_key]
             best_epoch = epoch
             checkpoint_path = output_dir / "best_model.pth"
             trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics)
-            print(f"  New best model with PQ: {best_pq:.4f}")
+            print(f"  New best model with {pq_key}: {best_pq:.4f}")
 
         if (epoch + 1) % 10 == 0:
             checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pth"

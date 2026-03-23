@@ -183,12 +183,14 @@ class CellViTMultiTaskLoss(nn.Module):
         lambda_nt_bce: float = 0.5,
         # tissue classification branch
         lambda_tc_ce: float = 0.1,
-        # Focal Tversky hyperparameters 
+        # Focal Tversky hyperparameters
         ft_alpha: float = 0.7,
         ft_beta: float = 0.3,
         ft_gamma: float = 4.0 / 3.0,
         ft_eps: float = 1e-6,
         unlabeled_class: int = None,
+        # per-class weights for NT CrossEntropyLoss
+        nt_class_weights: list = None,
     ):
         super().__init__()
         self.lambda_np_ft = lambda_np_ft
@@ -219,7 +221,8 @@ class CellViTMultiTaskLoss(nn.Module):
             ignore_classes=ignore,
         )
         self.dice_nt = DiceLoss(ignore_classes=ignore)
-        self.bce_nt = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        bce_weight = torch.tensor(nt_class_weights, dtype=torch.float32) if nt_class_weights is not None else None
+        self.bce_nt = nn.CrossEntropyLoss(ignore_index=ignore_index, weight=bce_weight)
 
         # TC branch
         self.ce_tc = nn.CrossEntropyLoss()
@@ -258,6 +261,8 @@ class CellViTMultiTaskLoss(nn.Module):
         loss_dict['hv_loss'] = l_hv.item()
 
         # NT branch
+        if self.bce_nt.weight is not None:
+            self.bce_nt.weight = self.bce_nt.weight.to(out_type.device)
         nt_ft = self.focal_tversky_nt(out_type, tgt_type)
         nt_dice = self.dice_nt(out_type, tgt_type)
         nt_bce = self.bce_nt(out_type, tgt_type)
