@@ -3,14 +3,16 @@ import torch
 import argparse
 import wandb
 import os
+import uuid
 from pathlib import Path
 
 from model.cellvit import CellViT
+from model.cellvit_tissue import CellViTWithTissue
 from datasets.panoptils import PanopTILsDataset, PanopTILsPaths
 from data.splits import load_splits
 from data.datamodule import DataConfig, PanopTILsDataModule
 from data.transforms import create_train_transforms, create_val_transforms
-from training.losses import CellViTMultiTaskLoss
+from training.losses import CellViTMultiTaskLoss, CellViTTissueLoss
 from training.trainer import Trainer
 
 
@@ -53,52 +55,44 @@ def load_vit_dino_pretrained(model, ckpt_path):
         print("Encoder weights loaded successfully")
 
 
-def _try_upload_checkpoint_to_datastore(local_path: Path, blob_path: str):
-    """upload checkpoint directly to Azure ML Datastore so retries can resume"""
-    try:
-        from azureml.core import Run
-        from azureml.core.datastore import Datastore
-        run = Run.get_context()
-        if getattr(run, 'id', 'OfflineRun') == 'OfflineRun':
-            return
-        ds = Datastore.get_default(run.experiment.workspace)
-        ds.upload_files(
-            files=[str(local_path)],
-            target_path=blob_path,
-            overwrite=True,
-            show_progress=False,
-        )
-        print(f"Checkpoint uploaded to datastore: {blob_path}/{local_path.name}")
-    except Exception as e:
-        print(f"[Warning] Datastore upload failed (non-fatal): {e}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/baseline.yaml",
                         help="Path to config YAML file")
     parser.add_argument("--dataset-path", type=str, default=None,
                         help="Override dataset root path")
+    parser.add_argument("--dataset-subdir", type=str, default=None,
+                        help="Subdirectory inside --dataset-path (Azure mount)")
     parser.add_argument("--encoder-path", type=str, default=None,
                         help="Override encoder checkpoint path")
+    parser.add_argument("--encoder-filename", type=str, default=None,
+                        help="Encoder weights filename inside --encoder-path")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Resume from checkpoint")
+    parser.add_argument("--checkpoint-mount", type=str, default=None,
+                        help="Persistent blob mount for checkpoints (Azure)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory for checkpoints")
-    parser.add_argument("--checkpoint-datastore-path", type=str, default=None,
-                        help="Blob path in default Datastore where checkpoints are uploaded each epoch")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Unique run ID for auto-resume (same ID = preemption restart, new ID = fresh start)")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     if args.dataset_path is not None:
-        cfg["data"]["root"] = args.dataset_path
-        print(f"Using dataset path from args: {args.dataset_path}")
+        dataset_root = args.dataset_path
+        if args.dataset_subdir:
+            dataset_root = os.path.join(dataset_root, args.dataset_subdir)
+        cfg["data"]["root"] = dataset_root
+        print(f"Using dataset path from args: {dataset_root}")
 
     if args.encoder_path is not None:
-        cfg["model"]["encoder_pretrained"] = args.encoder_path
-        print(f"Using encoder path from args: {args.encoder_path}")
+        encoder_path = args.encoder_path
+        if args.encoder_filename:
+            encoder_path = os.path.join(encoder_path, args.encoder_filename)
+        cfg["model"]["encoder_pretrained"] = encoder_path
+        print(f"Using encoder path from args: {encoder_path}")
 
 
     if torch.cuda.is_available():
@@ -117,16 +111,16 @@ def main():
         print("GPU not detected, using CPU")
 
     # output directory for checkpoints
-    if args.output_dir is not None:
+    if args.checkpoint_mount is not None:
+        output_dir = Path(args.checkpoint_mount)
+    elif args.output_dir is not None:
         output_dir = Path(args.output_dir)
     else:
         output_dir = Path("outputs") / f"fold_{cfg['splits']['fold']}"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints will be saved to: {output_dir.resolve()}")
 
-    cfg["data"]["unlabeled_class"] = cfg["model"].get("nuclei_unlabeled_class", None)
-    cfg["data"]["background_nuclei_class"] = cfg["model"].get("nuclei_background_class", None)
-
+    
     paths = PanopTILsPaths(root=cfg["data"]["root"], subset=cfg["data"]["subset"])
     tmp_ds = PanopTILsDataset(paths=paths, file_list=None, transforms=None, cache_dataset=False, include_tissue_label=False)
     all_files = tmp_ds.files
@@ -151,15 +145,43 @@ def main():
     )
     dm.setup()
 
-    model = CellViT(
-        num_nuclei_classes=cfg["model"]["num_nuclei_classes"],
-        num_tissue_classes=cfg["model"]["num_tissue_classes"],
-        embed_dim=cfg["model"]["embed_dim"],
-        input_channels=3,
-        depth=cfg["model"]["depth"],
-        num_heads=cfg["model"]["num_heads"],
-        extract_layers=cfg["model"]["extract_layers"],
-    )
+    data_cfg = cfg["data"]
+    num_nuclei_classes = data_cfg["num_nuclei_classes"]
+    num_tissue_classes = data_cfg["num_tissue_classes"]
+    unlabeled_class = data_cfg.get("nuclei_unlabeled_class", None)
+    background_class = data_cfg.get("nuclei_background_class", None)
+    ambiguous_classes = data_cfg.get("nuclei_ambiguous_classes", [])
+    tissue_ignore_classes = data_cfg.get("tissue_ignore_classes", [0])
+
+    tissue_fusion = cfg["model"].get("tissue_fusion", False)
+    use_tissue_branch = cfg["model"].get("use_tissue_branch", False) or tissue_fusion
+    use_compat = cfg["model"].get("use_compatibility_constraint", False)
+    compat_map = data_cfg.get("nuclei_tissue_compatibility", None)
+
+    if use_tissue_branch:
+        model = CellViTWithTissue(
+            tissue_fusion=tissue_fusion,
+            use_compatibility_constraint=use_compat,
+            nuclei_tissue_compatibility=compat_map,
+            num_nuclei_classes=num_nuclei_classes,
+            num_tissue_classes=num_tissue_classes,
+            embed_dim=cfg["model"]["embed_dim"],
+            input_channels=3,
+            depth=cfg["model"]["depth"],
+            num_heads=cfg["model"]["num_heads"],
+            extract_layers=cfg["model"]["extract_layers"],
+        )
+        print(f"Using CellViTWithTissue (fusion={tissue_fusion}, compat={use_compat})")
+    else:
+        model = CellViT(
+            num_nuclei_classes=num_nuclei_classes,
+            num_tissue_classes=num_tissue_classes,
+            embed_dim=cfg["model"]["embed_dim"],
+            input_channels=3,
+            depth=cfg["model"]["depth"],
+            num_heads=cfg["model"]["num_heads"],
+            extract_layers=cfg["model"]["extract_layers"],
+        )
 
     # load DINO pretrained weights
     ckpt = cfg["model"].get("encoder_pretrained", None)
@@ -170,20 +192,17 @@ def main():
 
     if hasattr(torch, "compile"):
         try:
-            model = torch.compile(model, mode="max-autotune")
-            print("Model compiled with torch.compile(mode='max-autotune')")
+            model = torch.compile(model, mode="reduce-overhead")
+            print("Model compiled with torch.compile(mode='reduce-overhead')")
         except Exception as e:
             print(f"torch.compile not available, continuing without: {e}")
 
-    unlabeled_class = cfg["model"].get("nuclei_unlabeled_class", None)
-    background_class = cfg["model"].get("nuclei_background_class", None)
-    num_nuclei_classes = cfg["model"]["num_nuclei_classes"]
 
     nt_class_weights = dm.nt_class_weights(num_nuclei_classes)
     print(f"NT class weights (inv-freq): {[f'{w:.3f}' for w in nt_class_weights]}")
 
     loss_cfg = cfg["loss"]
-    loss_fn = CellViTMultiTaskLoss(
+    shared_loss_kwargs = dict(
         lambda_np_ft=loss_cfg.get("lambda_np_ft", 1.0),
         lambda_np_dice=loss_cfg.get("lambda_np_dice", 1.0),
         lambda_hv_mse=loss_cfg.get("lambda_hv_mse", 2.5),
@@ -191,7 +210,7 @@ def main():
         lambda_nt_ft=loss_cfg.get("lambda_nt_ft", 0.5),
         lambda_nt_dice=loss_cfg.get("lambda_nt_dice", 0.2),
         lambda_nt_bce=loss_cfg.get("lambda_nt_bce", 0.5),
-        lambda_tc_ce=loss_cfg.get("lambda_tc_ce", 0.1),
+        lambda_tc_ce=loss_cfg.get("lambda_tc_ce", 0.0),
         ft_alpha=loss_cfg.get("ft_alpha", 0.7),
         ft_beta=loss_cfg.get("ft_beta", 0.3),
         ft_gamma=loss_cfg.get("ft_gamma", 4.0 / 3.0),
@@ -199,6 +218,25 @@ def main():
         unlabeled_class=unlabeled_class,
         nt_class_weights=nt_class_weights,
     )
+
+    ts_class_weights = None
+    if use_tissue_branch:
+        ts_class_weights = dm.ts_class_weights(
+            num_tissue_classes,
+            ignore_classes=set(tissue_ignore_classes),
+        )
+        print(f"Tissue class weights: {[f'{w:.3f}' for w in ts_class_weights]}")
+        loss_fn = CellViTTissueLoss(
+            lambda_ts_ft=loss_cfg.get("lambda_ts_ft", 1.0),
+            lambda_ts_dice=loss_cfg.get("lambda_ts_dice", 0.5),
+            lambda_ts_ce=loss_cfg.get("lambda_ts_ce", 1.0),
+            num_tissue_classes=num_tissue_classes,
+            tissue_ignore_classes=tissue_ignore_classes,
+            ts_class_weights=ts_class_weights,
+            **shared_loss_kwargs,
+        )
+    else:
+        loss_fn = CellViTMultiTaskLoss(**shared_loss_kwargs)
     
     optim = torch.optim.AdamW(
         model.parameters(),
@@ -233,32 +271,43 @@ def main():
         freeze_encoder_epochs=cfg["train"].get("freeze_encoder_epochs", 25),
         max_grad_norm=cfg["train"].get("max_grad_norm", 1.0),
         early_stopping_patience=cfg["train"].get("early_stopping_patience", None),
-        num_nuclei_classes=cfg["model"]["num_nuclei_classes"],
+        num_nuclei_classes=num_nuclei_classes,
+        num_tissue_classes=num_tissue_classes,
         unlabeled_class=unlabeled_class,
         background_class=background_class,
+        ambiguous_classes=ambiguous_classes,
+        tissue_ignore_classes=tissue_ignore_classes,
     )
 
+    run_id = args.run_id or uuid.uuid4().hex[:12]
+    print(f"Run ID: {run_id}")
+
     start_epoch = 0
+    best_pq = 0.0
+    best_epoch = 0
     checkpoint_to_load = None
     if args.checkpoint and os.path.exists(args.checkpoint):
         checkpoint_to_load = args.checkpoint
     else:
-        retry_ckpt = Path("./resume_checkpoint/latest_checkpoint.pth")
+        # auto-resume: look for latest_checkpoint.pth in output_dir
         auto_ckpt = output_dir / "latest_checkpoint.pth"
-        if retry_ckpt.exists():
-            checkpoint_to_load = str(retry_ckpt)
-            print(f"Auto-detected retry checkpoint: {retry_ckpt}")
-        elif auto_ckpt.exists():
-            checkpoint_to_load = str(auto_ckpt)
-            print(f"Auto-detected checkpoint: {auto_ckpt}")
+        if auto_ckpt.exists():
+            ckpt_data = torch.load(str(auto_ckpt), map_location="cpu", weights_only=False)
+            saved_run_id = ckpt_data.get('run_id')
+            if saved_run_id == run_id:
+                checkpoint_to_load = str(auto_ckpt)
+                print(f"Auto-resume: found checkpoint with matching run_id={run_id}")
+            else:
+                print(f"Checkpoint found but run_id mismatch (saved={saved_run_id}, current={run_id})\nStarting fresh")
+            del ckpt_data
 
     if checkpoint_to_load:
-        start_epoch = trainer.load_checkpoint(checkpoint_to_load)
-        print(f"Resuming from epoch {start_epoch}")
+        start_epoch, best_pq, best_epoch = trainer.load_checkpoint(checkpoint_to_load)
+        print(f"Resuming from epoch {start_epoch}, best_pq={best_pq:.4f} (epoch {best_epoch})")
 
     wandb_id_file = output_dir / "wandb_run_id.txt"
     wandb_run_id = None
-    if wandb_id_file.exists():
+    if start_epoch > 0 and wandb_id_file.exists():
         wandb_run_id = wandb_id_file.read_text().strip()
         print(f"Resuming wandb run: {wandb_run_id}")
 
@@ -287,9 +336,6 @@ def main():
 
     wandb_id_file.write_text(wandb.run.id)
 
-    best_pq = 0.0
-    best_epoch = 0
-
     train_loader = dm.train_dataloader()
     val_loader = dm.val_dataloader()
 
@@ -310,11 +356,7 @@ def main():
         # train
         train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
 
-        # reset early stopping counter when encoder unfreezes
         freeze_encoder_epochs = cfg["train"].get("freeze_encoder_epochs", 25)
-        if epoch == freeze_encoder_epochs and trainer.early_stopping is not None:
-            trainer.early_stopping.counter = 0
-            print(f"Early stopping counter reset after encoder unfreeze at epoch {epoch}")
 
         # validate
         is_last_epoch = (epoch == cfg["train"]["epochs"] - 1)
@@ -356,25 +398,22 @@ def main():
             print(f"  Val PQ: {val_metrics['pq']:.4f}")
             print(f"  Val F1: {val_metrics['f1']:.4f}")
 
-        latest_path = output_dir / "latest_checkpoint.pth"
-        trainer.save_checkpoint(str(latest_path), epoch, val_metrics)
-
-        if args.checkpoint_datastore_path:
-            _try_upload_checkpoint_to_datastore(latest_path, args.checkpoint_datastore_path)
-
         pq_key = 'pq_class_avg' if 'pq_class_avg' in val_metrics else 'pq'
         if pq_key in val_metrics and val_metrics[pq_key] > best_pq:
             best_pq = val_metrics[pq_key]
             best_epoch = epoch
             checkpoint_path = output_dir / "best_model.pth"
-            trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics)
+            trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics, best_pq=best_pq, best_epoch=best_epoch, run_id=run_id)
             print(f"  New best model with {pq_key}: {best_pq:.4f}")
+
+        latest_path = output_dir / "latest_checkpoint.pth"
+        trainer.save_checkpoint(str(latest_path), epoch, val_metrics, best_pq=best_pq, best_epoch=best_epoch, run_id=run_id)
 
         if (epoch + 1) % 10 == 0:
             checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pth"
-            trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics)
+            trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics, best_pq=best_pq, best_epoch=best_epoch, run_id=run_id)
 
-        if trainer.check_early_stopping(val_metrics):
+        if epoch >= freeze_encoder_epochs and trainer.check_early_stopping(val_metrics):
             print(f"\nEarly stopping triggered at epoch {epoch}")
             break
 

@@ -1,5 +1,5 @@
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Set
 import numpy as np
 from torch.utils.data import DataLoader
@@ -22,9 +22,14 @@ class DataConfig:
     persistent_workers: bool = True
     use_weighted_sampler: bool = True
     gamma_s: float = 0.85
-    unlabeled_class: Optional[int] = None
-    background_nuclei_class: Optional[int] = None
+    num_nuclei_classes: int = 10
+    num_tissue_classes: int = 9
+    nuclei_unlabeled_class: Optional[int] = None
+    nuclei_background_class: Optional[int] = None
+    nuclei_ambiguous_classes: List[int] = field(default_factory=list)
+    tissue_ignore_classes: List[int] = field(default_factory=lambda: [0])
     background_loss_weight: float = 0.3
+    nuclei_tissue_compatibility: Optional[dict] = None
 
 
 class PanopTILsDataModule:
@@ -45,7 +50,9 @@ class PanopTILsDataModule:
             transforms=self.train_transforms,
             cache_dataset=self.cfg.cache_dataset,
             include_tissue_label=True,
-            unlabeled_class=self.cfg.unlabeled_class,
+            unlabeled_class=self.cfg.nuclei_unlabeled_class,
+            background_class=self.cfg.nuclei_background_class,
+            ambiguous_classes=self.cfg.nuclei_ambiguous_classes,
         )
         self.val_ds = PanopTILsDataset(
             paths=paths,
@@ -54,7 +61,9 @@ class PanopTILsDataModule:
             cache_dataset=self.cfg.cache_dataset,
             include_tissue_label=True,
             cache_hv_maps=True,
-            unlabeled_class=self.cfg.unlabeled_class,
+            unlabeled_class=self.cfg.nuclei_unlabeled_class,
+            background_class=self.cfg.nuclei_background_class,
+            ambiguous_classes=self.cfg.nuclei_ambiguous_classes,
         )
 
         self._patch_tissue_classes: List[int] = []
@@ -68,10 +77,11 @@ class PanopTILsDataModule:
         self._val_loader = None
 
     def nt_class_weights(self, num_nuclei_classes: int) -> List[float]:
-        unlabeled = self.cfg.unlabeled_class    
-        background = self.cfg.background_nuclei_class  
+        unlabeled = self.cfg.nuclei_unlabeled_class
+        background = self.cfg.nuclei_background_class
+        ambiguous = set(self.cfg.nuclei_ambiguous_classes)
         nucleus_classes = [c for c in range(num_nuclei_classes)
-                           if c != unlabeled and c != background]
+                           if c != unlabeled and c != background and c not in ambiguous]
 
         counts = Counter()
         for class_set in self._patch_nuclei_classes:
@@ -89,16 +99,30 @@ class PanopTILsDataModule:
             weights[background] = self.cfg.background_loss_weight
         return weights
 
+    def ts_class_weights(self, num_tissue_classes: int,
+                         ignore_classes: set) -> List[float]:
+        counts = self.train_ds.tissue_pixel_counts
+        active = [c for c in range(num_tissue_classes) if c not in ignore_classes]
+
+        nonzero = [counts[c] for c in active if counts[c] > 0]
+        median_count = float(np.median(nonzero)) if nonzero else 1.0
+
+        weights = [0.0] * num_tissue_classes
+        for c in active:
+            weights[c] = median_count / counts[c] if counts[c] > 0 else median_count
+        return weights
+
     def train_dataloader(self):
         if self._train_loader is not None:
             return self._train_loader
 
         if self.cfg.use_weighted_sampler:
             ignore: set = set()
-            if self.cfg.unlabeled_class is not None:
-                ignore.add(self.cfg.unlabeled_class)
-            if self.cfg.background_nuclei_class is not None:
-                ignore.add(self.cfg.background_nuclei_class)
+            if self.cfg.nuclei_unlabeled_class is not None:
+                ignore.add(self.cfg.nuclei_unlabeled_class)
+            if self.cfg.nuclei_background_class is not None:
+                ignore.add(self.cfg.nuclei_background_class)
+            ignore.update(self.cfg.nuclei_ambiguous_classes)
 
             weights = compute_sampling_weights(
                 patch_tissue_classes=self._patch_tissue_classes,

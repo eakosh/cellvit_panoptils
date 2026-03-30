@@ -2,8 +2,8 @@
 data:
   root: "PanopTILs_data/BootstrapNucleiManualRegions_TCGA_05132021"
   subset: "tcga"
-  batch_size: 16  
-  num_workers: 10  
+  batch_size: 16
+  num_workers: 10
   cache_dataset: true
   pin_memory: true
   persistent_workers: true
@@ -11,19 +11,37 @@ data:
   use_weighted_sampler: true
   gamma_s: 1.5
 
-splits:
-  fold: 5
-
-model:
   num_nuclei_classes: 10
   num_tissue_classes: 9
-  nuclei_unlabeled_class: 0  
-  nuclei_background_class: 9 
+  nuclei_unlabeled_class: 0
+  nuclei_background_class: 9
+  nuclei_ambiguous_classes: [8]        # Unknown/Ambiguous
+  tissue_ignore_classes: [0, 6, 7]     # Exclude, Blood, Other
+
+  # compatibility constraint: which nucleus types are allowed in which tissue regions
+  # key = nucleus class, value = list of allowed tissue classes  
+  nuclei_tissue_compatibility:
+    1: [1]              
+    2: [2, 3]           
+    3: [2, 3]           
+    4: [2, 3]           
+    5: [2, 3]           
+    6: [4]              
+    7: [7]              
+    9: [1,2,3,4,5,6,7]  
+
+splits:
+  fold: 1
+
+model:
   embed_dim: 384
   depth: 12
   num_heads: 6
   extract_layers: [3, 6, 9, 12]
   encoder_pretrained: "weights/vit256_small_dino.pth"
+  use_tissue_branch: true
+  tissue_fusion: true
+  use_compatibility_constraint: true
 
 loss:
   # binary branch
@@ -39,8 +57,13 @@ loss:
   lambda_nt_dice: 0.5
   lambda_nt_bce: 1.0
 
-  # tissue classification branch
+  # tissue classification branch (global CLS token, legacy — keep 0)
   lambda_tc_ce: 0.0
+
+  # tissue segmentation branch
+  lambda_ts_ft: 1.0
+  lambda_ts_dice: 0.5
+  lambda_ts_ce: 1.0
 
   # Focal Tversky hyperparameters
   ft_alpha: 0.4
@@ -53,7 +76,7 @@ train:
   wd: 0.0001           # weight decay
   betas: [0.9, 0.999]  # Adam betas 
 
-  epochs: 130
+  epochs: 60
 
   scheduler_type: exponential
   scheduler_gamma: 0.95  
@@ -67,4 +90,4 @@ train:
 
   val_metric_interval: 10
 
-  early_stopping_patience: 15
+  early_stopping_patience: 40

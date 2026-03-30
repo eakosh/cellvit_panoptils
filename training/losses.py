@@ -286,3 +286,86 @@ class CellViTMultiTaskLoss(nn.Module):
         total_loss = l_np + l_hv + l_nt + l_tc
 
         return total_loss, loss_dict
+
+
+class CellViTTissueLoss(CellViTMultiTaskLoss):
+    def __init__(
+        self,
+        lambda_ts_ft: float = 1.0,
+        lambda_ts_dice: float = 0.5,
+        lambda_ts_ce: float = 1.0,
+        num_tissue_classes: int = 9,
+        tissue_ignore_classes: list = None,
+        ts_class_weights: list = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.lambda_ts_ft = lambda_ts_ft
+        self.lambda_ts_dice = lambda_ts_dice
+        self.lambda_ts_ce = lambda_ts_ce
+
+        tissue_ignore = tissue_ignore_classes if tissue_ignore_classes else [0]
+        self._tissue_ignore_set = set(tissue_ignore)
+        self._ce_ignore_val = tissue_ignore[0]
+
+        ft_alpha = kwargs.get("ft_alpha", 0.7)
+        ft_beta  = kwargs.get("ft_beta",  0.3)
+        ft_gamma = kwargs.get("ft_gamma", 4.0 / 3.0)
+        ft_eps   = kwargs.get("ft_eps",   1e-6)
+
+        self.focal_tversky_ts = FocalTverskyLoss(
+            alpha=ft_alpha, beta=ft_beta, gamma=ft_gamma, smooth=ft_eps,
+            ignore_classes=tissue_ignore,
+        )
+        self.dice_ts = DiceLoss(ignore_classes=tissue_ignore)
+        ce_weight = torch.tensor(ts_class_weights, dtype=torch.float32) if ts_class_weights else None
+        self.ce_ts = nn.CrossEntropyLoss(ignore_index=self._ce_ignore_val, weight=ce_weight)
+
+    def forward(self, outputs, targets):
+        total_loss, loss_dict = super().forward(outputs, targets)
+
+        if "nuclei_type_map_pre" in outputs:
+            out_pre = outputs["nuclei_type_map_pre"].float()
+            tgt_type = targets["nuclei_type_map"]
+            pre_ft = self.focal_tversky_nt(out_pre, tgt_type)
+            pre_dice = self.dice_nt(out_pre, tgt_type)
+            pre_bce = self.bce_nt(out_pre, tgt_type)
+            l_nt_pre = (
+                self.lambda_nt_ft * pre_ft
+                + self.lambda_nt_dice * pre_dice
+                + self.lambda_nt_bce * pre_bce
+            )
+            total_loss = total_loss + l_nt_pre
+            loss_dict["nt_pre_loss"] = l_nt_pre.item()
+
+        l_ts = torch.tensor(0.0, device=total_loss.device)
+        active = self.lambda_ts_ft + self.lambda_ts_dice + self.lambda_ts_ce
+        if active > 0 and "tissue_segmentation_map" in outputs and "tissue_mask" in targets:
+            out_ts = outputs["tissue_segmentation_map"].float()
+            tgt_ts = targets["tissue_mask"]          # (B, H, W)
+
+            if self.ce_ts.weight is not None:
+                self.ce_ts.weight = self.ce_ts.weight.to(out_ts.device)
+            
+            ts_ft   = self.focal_tversky_ts(out_ts, tgt_ts)
+            ts_dice = self.dice_ts(out_ts, tgt_ts)
+            
+            tgt_ce = tgt_ts
+            if len(self._tissue_ignore_set) > 1:
+                tgt_ce = tgt_ts.clone()
+                for c in self._tissue_ignore_set:
+                    if c != self._ce_ignore_val:
+                        tgt_ce[tgt_ts == c] = self._ce_ignore_val
+            ts_ce = self.ce_ts(out_ts, tgt_ce)
+
+            l_ts = (
+                self.lambda_ts_ft   * ts_ft
+                + self.lambda_ts_dice * ts_dice
+                + self.lambda_ts_ce  * ts_ce
+            )
+            loss_dict["ts_ft"]   = ts_ft.item()
+            loss_dict["ts_dice"] = ts_dice.item()
+            loss_dict["ts_ce"]   = ts_ce.item()
+            loss_dict["ts_loss"] = l_ts.item()
+
+        return total_loss + l_ts, loss_dict

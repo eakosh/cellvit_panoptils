@@ -486,7 +486,7 @@ class CellViT256(CellViT):
         Args:
             model256_path (str): Path to ViT-256
         """
-        state_dict = torch.load(str(model256_path), map_location="cpu")["teacher"]
+        state_dict = torch.load(str(model256_path), map_location="cpu", weights_only=False)["teacher"]
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
         msg = self.encoder.load_state_dict(state_dict, strict=False)
@@ -577,7 +577,7 @@ class CellViTSAM(CellViT):
         Args:
             model_path (str): Path to SAM model
         """
-        state_dict = torch.load(str(model_path), map_location="cpu")
+        state_dict = torch.load(str(model_path), map_location="cpu", weights_only=False)
         image_encoder = self.encoder
         msg = image_encoder.load_state_dict(state_dict, strict=False)
         print(f"Loading checkpoint: {msg}")

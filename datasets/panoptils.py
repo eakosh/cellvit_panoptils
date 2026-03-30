@@ -1,4 +1,5 @@
 import os
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Optional, Dict, List, Tuple
 
@@ -30,6 +31,8 @@ class PanopTILsDataset(Dataset):
         include_tissue_label: bool = True,
         cache_hv_maps: bool = False,
         unlabeled_class: Optional[int] = None,
+        background_class: Optional[int] = None,
+        ambiguous_classes: Optional[List[int]] = None,
     ):
         self.paths = paths
         self.transforms = transforms
@@ -37,6 +40,16 @@ class PanopTILsDataset(Dataset):
         self.include_tissue_label = include_tissue_label
         self.cache_hv_maps = cache_hv_maps
         self.unlabeled_class = unlabeled_class
+        self.background_class = background_class
+        self.ambiguous_classes = set(ambiguous_classes) if ambiguous_classes else set()
+
+        # classes to remap, unlabeled for nuclei that have instance but unreliable type
+        self._remap_to_unlabeled: set = set()
+        if unlabeled_class is not None:
+            self._remap_to_unlabeled.add(unlabeled_class)
+        if background_class is not None:
+            self._remap_to_unlabeled.add(background_class)
+        self._remap_to_unlabeled.update(self.ambiguous_classes)
         self._hv_cache: Dict[int, np.ndarray] = {}
 
         self.rgb_dir = os.path.join(paths.root, paths.subset, "rgbs")
@@ -59,6 +72,7 @@ class PanopTILsDataset(Dataset):
         self.patches_per_image = self.tiles_per_side ** 2
        
         self.meta = {}
+        self.tissue_pixel_counts: Counter = Counter()
         if self.include_tissue_label:
             print("Computing patch-level tissue and nuclei classes from masks...")
             for f in self.files:
@@ -68,10 +82,15 @@ class PanopTILsDataset(Dataset):
                 if os.path.exists(mask_path):
                     try:
                         mask = np.array(Image.open(mask_path))
-                        
+
                         tissue_mask = mask[:, :, 0]
                         nuclei_type_mask = mask[:, :, 1]
-                        
+
+                        # accumulate pixel-level tissue class frequencies
+                        vals, cnts = np.unique(tissue_mask, return_counts=True)
+                        for v, c in zip(vals, cnts):
+                            self.tissue_pixel_counts[int(v)] += int(c)
+
                         patch_classes = []
                         patch_tissue_classes = []
                         for patch_idx in range(self.patches_per_image):
@@ -81,7 +100,8 @@ class PanopTILsDataset(Dataset):
                             x0 = px * self.PATCH_SIZE
 
                             patch_nuc = nuclei_type_mask[y0:y0 + self.PATCH_SIZE, x0:x0 + self.PATCH_SIZE]
-                            classes = {int(c) for c in np.unique(patch_nuc) if 0 < int(c) < 9}
+                            classes = {int(c) for c in np.unique(patch_nuc)
+                                       if int(c) not in self._remap_to_unlabeled}
                             patch_classes.append(classes)
 
                             patch_tis = tissue_mask[y0:y0 + self.PATCH_SIZE, x0:x0 + self.PATCH_SIZE]
@@ -217,9 +237,10 @@ class PanopTILsDataset(Dataset):
             instance_map[mask] = lut[instance_map[mask]]
 
         nuclei_type_map = nuclei_mask.copy()
-        nuclei_type_map[instance_map == 0] = 9
-        if self.unlabeled_class is not None:
-            untyped = (instance_map > 0) & ((nuclei_mask == 0) | (nuclei_mask == 9))
+        if self.background_class is not None:
+            nuclei_type_map[instance_map == 0] = self.background_class
+        if self.unlabeled_class is not None and self._remap_to_unlabeled:
+            untyped = (instance_map > 0) & np.isin(nuclei_mask, list(self._remap_to_unlabeled))
             nuclei_type_map[untyped] = self.unlabeled_class
 
         if self.transforms is not None:

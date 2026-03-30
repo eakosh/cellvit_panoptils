@@ -1,10 +1,11 @@
+import os
 import torch
 from tqdm import tqdm
 import numpy as np
 from typing import Dict
 
 from model.utils.post_proc_cellvit import DetectionCellPostProcessor
-from utils.metrics import MetricsAggregator
+from utils.metrics import MetricsAggregator, compute_tissue_dice
 
 
 class EarlyStopping:
@@ -47,10 +48,15 @@ class Trainer:
         max_grad_norm=1.0,
         early_stopping_patience=None,
         num_nuclei_classes=10,
+        num_tissue_classes=9,
         unlabeled_class=None,
         background_class=None,
+        ambiguous_classes=(),
         centroid_radius=12.0,
+        tissue_ignore_classes=None,
     ):
+        self.num_tissue_classes = num_tissue_classes
+        self.tissue_ignore_classes = set(tissue_ignore_classes) if tissue_ignore_classes else {0}
         self.model = model.to(device)
         self.loss_fn = loss_fn
         self.optimizer = optimizer
@@ -72,6 +78,7 @@ class Trainer:
             num_classes=num_nuclei_classes,
             unlabeled_class=unlabeled_class,
             background_class=background_class,
+            ambiguous_classes=tuple(ambiguous_classes),
             centroid_radius=centroid_radius,
         )
 
@@ -192,6 +199,9 @@ class Trainer:
         total_loss = 0.0
         loss_components = {}
         batch_count = 0
+        
+        tissue_acc = {}
+        tissue_n = 0
 
         desc = f"Val Epoch {epoch}" + (" [full]" if compute_full_metrics else " [loss only]")
         pbar = tqdm(loader, desc=desc)
@@ -237,6 +247,20 @@ class Trainer:
                         gt_type_map=gt_type[i],
                     )
 
+                # tissue dice
+                if "tissue_segmentation_map" in outputs:
+                    pred_t = torch.argmax(outputs["tissue_segmentation_map"], dim=1).cpu().numpy()
+                    gt_t = targets["tissue_mask"].cpu().numpy()
+                    for i in range(pred_t.shape[0]):
+                        td = compute_tissue_dice(
+                            pred_t[i], gt_t[i],
+                            num_classes=self.num_tissue_classes,
+                            ignore_classes=self.tissue_ignore_classes,
+                        )
+                        for k, v in td.items():
+                            tissue_acc[k] = tissue_acc.get(k, 0.0) + v
+                        tissue_n += 1
+
             pbar.set_postfix({'loss': f'{batch_loss:.4f}'})
 
         avg_loss = total_loss / max(1, batch_count)
@@ -251,6 +275,12 @@ class Trainer:
             val_metrics = self.metrics_aggregator.compute()
             metrics.update(val_metrics)
             print(f"\nValidation Metrics - {self.metrics_aggregator}\n")
+
+            if tissue_n > 0 and "mean" in tissue_acc:
+                metrics["tissue_dice"] = tissue_acc["mean"] / tissue_n
+                for c in range(1, self.num_tissue_classes):
+                    if c in tissue_acc:
+                        metrics[f"tissue_dice_class_{c}"] = tissue_acc[c] / tissue_n
 
         return metrics
 
@@ -308,36 +338,56 @@ class Trainer:
         gt_type = targets['nuclei_type_map'].cpu().numpy()
         gt_hv = targets['hv_map'].cpu().numpy()  # [B, 2, H, W]
 
+        # tissue segmentation
+        has_tissue = "tissue_segmentation_map" in outputs
+        if has_tissue:
+            pred_tissue = torch.argmax(outputs['tissue_segmentation_map'], dim=1).cpu().numpy()
+            gt_tissue = targets['tissue_mask'].cpu().numpy()
+
         # denormalize images
         imgs_np = images.cpu().numpy()  # [B, C, H, W]
         imgs_np = np.clip(imgs_np * 0.5 + 0.5, 0, 1)
         imgs_np = (imgs_np * 255).astype(np.uint8).transpose(0, 2, 3, 1)  # [B, H, W, C]
 
-        # discrete colormap
+        # discrete colormaps
         n_cls = self.num_nuclei_classes
         type_cmap = plt.cm.get_cmap('tab10', n_cls)
         type_norm = mcolors.BoundaryNorm(np.arange(n_cls + 1) - 0.5, n_cls)
 
+        n_tis = self.num_tissue_classes
+        tissue_cmap = plt.cm.get_cmap('tab10', n_tis)
+        tissue_norm = mcolors.BoundaryNorm(np.arange(n_tis + 1) - 0.5, n_tis)
+
+        num_cols = 6 if has_tissue else 5
         wandb_images = []
         for i in range(n_samples):
-            fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+            fig, axes = plt.subplots(2, num_cols, figsize=(4 * num_cols, 8))
             name = names[i] if i < len(names) else str(i)
             fig.suptitle(f"Sample: {name}", fontsize=10)
 
-            row_data = [
-                (gt_binary[i], gt_type[i], gt_hv[i, 0], gt_hv[i, 1], "GT"),
-                (pred_binary[i], pred_type[i], pred_hv[i, 0], pred_hv[i, 1], "Pred"),
-            ]
-            col_titles = ["Input", "Binary", "Type", "HV_H", "HV_V"]
+            for row_idx, row_label in enumerate(["GT", "Pred"]):
+                binary  = gt_binary[i]  if row_idx == 0 else pred_binary[i]
+                typ     = gt_type[i]    if row_idx == 0 else pred_type[i]
+                hv_h    = gt_hv[i, 0]   if row_idx == 0 else pred_hv[i, 0]
+                hv_v    = gt_hv[i, 1]   if row_idx == 0 else pred_hv[i, 1]
 
-            for row_idx, (binary, type_map, hv_h, hv_v, row_label) in enumerate(row_data):
                 axes[row_idx, 0].imshow(imgs_np[i])
+                axes[row_idx, 0].set_title(f"{row_label} Input", fontsize=8)
                 axes[row_idx, 1].imshow(binary, cmap='gray', vmin=0, vmax=1)
-                axes[row_idx, 2].imshow(type_map, cmap=type_cmap, norm=type_norm, interpolation='nearest')
+                axes[row_idx, 1].set_title(f"{row_label} Binary", fontsize=8)
+                axes[row_idx, 2].imshow(typ, cmap=type_cmap, norm=type_norm, interpolation='nearest')
+                axes[row_idx, 2].set_title(f"{row_label} Type", fontsize=8)
                 axes[row_idx, 3].imshow(hv_h, cmap='RdBu', vmin=-1, vmax=1)
+                axes[row_idx, 3].set_title(f"{row_label} HV_H", fontsize=8)
                 axes[row_idx, 4].imshow(hv_v, cmap='RdBu', vmin=-1, vmax=1)
-                for col_idx, title in enumerate(col_titles):
-                    axes[row_idx, col_idx].set_title(f"{row_label} {title}", fontsize=8)
+                axes[row_idx, 4].set_title(f"{row_label} HV_V", fontsize=8)
+
+                if has_tissue:
+                    tis = gt_tissue[i] if row_idx == 0 else pred_tissue[i]
+                    axes[row_idx, 5].imshow(tis, cmap=tissue_cmap, norm=tissue_norm, interpolation='nearest')
+                    axes[row_idx, 5].set_title(f"{row_label} Tissue", fontsize=8)
+
+                for col_idx in range(num_cols):
                     axes[row_idx, col_idx].axis('off')
 
             plt.tight_layout()
@@ -351,13 +401,17 @@ class Trainer:
             return False
         return self.early_stopping.step(val_metrics['loss'])
 
-    def save_checkpoint(self, path: str, epoch: int, val_metrics: Dict[str, float]):
+    def save_checkpoint(self, path: str, epoch: int, val_metrics: Dict[str, float], best_pq: float = 0.0, best_epoch: int = 0, run_id: str = None):
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'val_metrics': val_metrics,
+            'best_pq': best_pq,
+            'best_epoch': best_epoch,
         }
+        if run_id is not None:
+            checkpoint['run_id'] = run_id
 
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
@@ -372,11 +426,13 @@ class Trainer:
                 'should_stop': self.early_stopping.should_stop,
             }
 
-        torch.save(checkpoint, path)
+        tmp_path = path + ".tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, path)
         print(f"Checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str):
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -396,6 +452,8 @@ class Trainer:
             print(f"Early stopping state restored (counter={es_state['counter']}, best={es_state['best_score']})")
 
         epoch = checkpoint.get('epoch', 0)
+        best_pq = checkpoint.get('best_pq', 0.0)
+        best_epoch = checkpoint.get('best_epoch', 0)
         print(f"Checkpoint loaded from {path} (epoch {epoch})")
 
-        return epoch
+        return epoch + 1, best_pq, best_epoch  

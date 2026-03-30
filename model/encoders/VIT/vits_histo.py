@@ -573,7 +573,7 @@ class ViT256_16(nn.Module):
 
         # load pretrained network weights
         checkpoint_key = "teacher"  # use teacher networks since it outperforms student
-        state_dict = torch.load(str(model256_path), map_location=device)[checkpoint_key]
+        state_dict = torch.load(str(model256_path), map_location=device, weights_only=False)[checkpoint_key]
         # remove `module.` prefix
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         # remove `backbone.` prefix induced by multicrop wrapper

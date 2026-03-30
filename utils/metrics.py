@@ -270,11 +270,13 @@ class MetricsAggregator:
         num_classes: int = 0,
         unlabeled_class: int = None,
         background_class: int = None,
+        ambiguous_classes: tuple = (),
         centroid_radius: float = 12.0,
     ):
         self.num_classes = num_classes
         self.unlabeled_class = unlabeled_class
         self.background_class = background_class
+        self.ambiguous_classes = set(ambiguous_classes)
         self.centroid_radius = centroid_radius
         self.reset()
 
@@ -288,6 +290,7 @@ class MetricsAggregator:
         self.dice_scores = []
 
         _skip = {c for c in [self.unlabeled_class, self.background_class] if c is not None}
+        _skip.update(self.ambiguous_classes)
 
         self.per_class_pq: Dict[int, List[float]] = {
             c: [] for c in range(1, self.num_classes) if c not in _skip
@@ -358,7 +361,7 @@ class MetricsAggregator:
                 pred_ids_all = np.unique(pred_instances[pred_instances > 0])
                 gt_ids_all   = np.unique(gt_instances[gt_instances > 0])
 
-                _excl = tuple(c for c in [self.unlabeled_class, self.background_class] if c is not None)
+                _excl = tuple({c for c in [self.unlabeled_class, self.background_class] if c is not None} | self.ambiguous_classes)
                 pred_types = _get_instance_types(pred_instances, pred_type_map, pred_ids_all, exclude_labels=_excl)
                 gt_types   = _get_instance_types(gt_instances,   gt_type_map,   gt_ids_all,   exclude_labels=_excl)
 
@@ -456,3 +459,36 @@ class MetricsAggregator:
         if 'dice' in m:
             parts.append(f"Dice={m['dice']:.4f}")
         return "  |  ".join(parts)
+
+
+def compute_tissue_dice(pred_tissue: np.ndarray, gt_tissue: np.ndarray,
+                        num_classes: int = 9,
+                        ignore_classes: set = None) -> Dict[str, float]:
+    """Compute per-class and mean DICE for tissue segmentation
+
+    Args:
+        pred_tissue: (H, W) predicted tissue class map
+        gt_tissue: (H, W) ground-truth tissue class map
+        num_classes: total number of tissue classes
+        ignore_classes: classes to exclude from metrics
+
+    Returns:
+        dict with keys: mean, and per-class entries
+    """
+    if ignore_classes is None:
+        ignore_classes = {0}
+    results = {}
+    dice_vals = []
+    for c in range(num_classes):
+        if c in ignore_classes:
+            continue
+        pred_c = (pred_tissue == c)
+        gt_c   = (gt_tissue == c)
+        denom  = pred_c.sum() + gt_c.sum()
+        if denom == 0:
+            continue
+        dice = 2.0 * (pred_c & gt_c).sum() / denom
+        results[c] = float(dice)
+        dice_vals.append(float(dice))
+    results["mean"] = float(np.mean(dice_vals)) if dice_vals else 0.0
+    return results
