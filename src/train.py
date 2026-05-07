@@ -7,10 +7,11 @@ import uuid
 from pathlib import Path
 
 from model.cellvit import CellViT
-from model.cellvit_tissue import CellViTWithTissue
+from model.cellvit_panoptils import CellViTWithTissue
 from datasets.panoptils import PanopTILsDataset, PanopTILsPaths
-from data.splits import load_splits
+from data.splits import load_splits, load_dev_split
 from data.datamodule import DataConfig, PanopTILsDataModule
+from data.constants import NUCLEI_TISSUE_COMPATIBILITY
 from data.transforms import create_train_transforms, create_val_transforms
 from training.losses import CellViTMultiTaskLoss, CellViTTissueLoss
 from training.trainer import Trainer
@@ -39,17 +40,14 @@ def load_vit_dino_pretrained(model, ckpt_path):
         k = k.replace("backbone.", "")
         new_state[k] = v
 
-    missing, unexpected = model.encoder.load_state_dict(
-        new_state,
-        strict=False
-    )
+    missing, unexpected = model.encoder.load_state_dict(new_state, strict=False)
 
     print("DINO encoder loaded")
     print(f"Missing keys: {len(missing)}")
     print(f"Unexpected keys: {len(unexpected)}")
 
     if len(missing) > 10:
-        print(f"WARNING: {len(missing)} keys are missing. Encoder may not be properly initialized")
+        print(f"Warning: {len(missing)} keys are missing. Encoder may not be properly initialized")
         print(f"\tFirst 5 missing: {missing[:5]}")
     else:
         print("Encoder weights loaded successfully")
@@ -62,7 +60,7 @@ def main():
     parser.add_argument("--dataset-path", type=str, default=None,
                         help="Override dataset root path")
     parser.add_argument("--dataset-subdir", type=str, default=None,
-                        help="Subdirectory inside --dataset-path (Azure mount)")
+                        help="Subdirectory inside --dataset-path")
     parser.add_argument("--encoder-path", type=str, default=None,
                         help="Override encoder checkpoint path")
     parser.add_argument("--encoder-filename", type=str, default=None,
@@ -70,15 +68,42 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Resume from checkpoint")
     parser.add_argument("--checkpoint-mount", type=str, default=None,
-                        help="Persistent blob mount for checkpoints (Azure)")
+                        help="Persistent blob mount for checkpoints")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory for checkpoints")
     parser.add_argument("--run-id", type=str, default=None,
-                        help="Unique run ID for auto-resume (same ID = preemption restart, new ID = fresh start)")
+                        help="Unique run ID for auto-resume")
+    parser.add_argument("--no-strict", action="store_true",
+                        help="Load checkpoint with strict=False")
+    parser.add_argument("--gamma-s", type=float, default=None,
+                        help="Override data.gamma_s")
+    parser.add_argument("--nt-weight-scale", type=float, default=None,
+                        help="Multiply lambda_nt_ft/dice/bce by this scale")
+    parser.add_argument("--fusion-embed-dim", type=int, default=None,
+                        help="Override model.fusion_embed_dim (cross_attn_bottleneck)")
+    parser.add_argument("--fusion-reduction", type=int, default=None,
+                        help="Override model.fusion_reduction (AFF channel attention reduction)")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
+    if args.gamma_s is not None:
+        cfg["data"]["gamma_s"] = args.gamma_s
+        print(f"Override: data.gamma_s = {args.gamma_s}")
+    if args.nt_weight_scale is not None:
+        scale = args.nt_weight_scale
+        for key in ("lambda_nt_ft", "lambda_nt_dice", "lambda_nt_bce"):
+            base = cfg["loss"].get(key, 0.0)
+            cfg["loss"][key] = round(base * scale, 6)
+        print(f"Override: NT loss weights with {scale}: ft={cfg['loss']['lambda_nt_ft']},"
+              f"dice={cfg['loss']['lambda_nt_dice']}, bce={cfg['loss']['lambda_nt_bce']}")
+    if args.fusion_embed_dim is not None:
+        cfg["model"]["fusion_embed_dim"] = args.fusion_embed_dim
+        print(f"Override: model.fusion_embed_dim = {args.fusion_embed_dim}")
+    if args.fusion_reduction is not None:
+        cfg["model"]["fusion_reduction"] = args.fusion_reduction
+        print(f"Override: model.fusion_reduction = {args.fusion_reduction}")
 
     if args.dataset_path is not None:
         dataset_root = args.dataset_path
@@ -98,11 +123,9 @@ def main():
     if torch.cuda.is_available():
         device = "cuda"
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        print(f"\tAvailable memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
-        # A100: enable TF32 for faster matrix multiplications
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
@@ -110,59 +133,78 @@ def main():
         device = "cpu"
         print("GPU not detected, using CPU")
 
-    # output directory for checkpoints
+    experiment_name = cfg.get("experiment", "experiment")
+
     if args.checkpoint_mount is not None:
         output_dir = Path(args.checkpoint_mount)
     elif args.output_dir is not None:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = Path("outputs") / f"fold_{cfg['splits']['fold']}"
+        split_mode = cfg["splits"].get("mode", "fold")
+        label = split_mode if split_mode == "dev" else f"fold_{cfg['splits'].get('fold', 0)}"
+        output_dir = Path("outputs") / label
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Checkpoints will be saved to: {output_dir.resolve()}")
+
+    best_output_dir = Path("outputs")
+    best_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Latest checkpoint will be saved to: {output_dir.resolve()}")
+    print(f"Best model will be saved to: {best_output_dir.resolve()}")
 
     
     paths = PanopTILsPaths(root=cfg["data"]["root"], subset=cfg["data"]["subset"])
     tmp_ds = PanopTILsDataset(paths=paths, file_list=None, transforms=None, cache_dataset=False, include_tissue_label=False)
     all_files = tmp_ds.files
 
-    fold_id = cfg["splits"]["fold"]
-    train_files, val_files = load_splits(all_files, root=cfg["data"]["root"], fold=fold_id)
-
+    split_mode = cfg["splits"].get("mode", "fold")
     print(f"\nDataset: {cfg['data']['subset']}")
     print(f"Total files: {len(all_files)}")
-    print(f"Fold {fold_id}/5: Train={len(train_files)}, Val={len(val_files)}\n")
+    if split_mode == "dev":
+        num_val_h = cfg["splits"].get("num_val_hospitals", 10)
+        train_files, val_files = load_dev_split(all_files, root=cfg["data"]["root"], num_val_hospitals=num_val_h)
+        print(f"Dev mode: Train={len(train_files)}, Val={len(val_files)}\n")
+    else:
+        fold_id = cfg["splits"]["fold"]
+        train_files, val_files = load_splits(all_files, root=cfg["data"]["root"], fold=fold_id)
+        print(f"Fold {fold_id}/5: Train={len(train_files)}, Val={len(val_files)}\n")
 
-    # data augmentation
     train_transforms = create_train_transforms(image_size=256)
     val_transforms = create_val_transforms(image_size=256)
 
-    dm = PanopTILsDataModule(
-        cfg=DataConfig(**cfg["data"]),
-        train_files=train_files,
-        val_files=val_files,
-        train_transforms=train_transforms,
-        val_transforms=val_transforms,
-    )
+    dm = PanopTILsDataModule(cfg=DataConfig(**cfg["data"]),
+                             train_files=train_files,
+                             val_files=val_files,
+                             train_transforms=train_transforms,
+                             val_transforms=val_transforms,)
     dm.setup()
 
     data_cfg = cfg["data"]
     num_nuclei_classes = data_cfg["num_nuclei_classes"]
     num_tissue_classes = data_cfg["num_tissue_classes"]
     unlabeled_class = data_cfg.get("nuclei_unlabeled_class", None)
-    background_class = data_cfg.get("nuclei_background_class", None)
-    ambiguous_classes = data_cfg.get("nuclei_ambiguous_classes", [])
     tissue_ignore_classes = data_cfg.get("tissue_ignore_classes", [0])
 
-    tissue_fusion = cfg["model"].get("tissue_fusion", False)
-    use_tissue_branch = cfg["model"].get("use_tissue_branch", False) or tissue_fusion
+    tissue_fusion = cfg["model"].get("tissue_fusion", "none") 
+    use_tissue_branch = cfg["model"].get("use_tissue_branch", False) or tissue_fusion != "none" 
     use_compat = cfg["model"].get("use_compatibility_constraint", False)
-    compat_map = data_cfg.get("nuclei_tissue_compatibility", None)
+    compat_map = NUCLEI_TISSUE_COMPATIBILITY
 
     if use_tissue_branch:
+        fusion_warmup = cfg["model"].get("fusion_warmup_epochs", 0)
+        freeze_tissue = cfg["model"].get("freeze_tissue_after_fusion_warmup", True)
+        tissue_encoder_type = cfg["model"].get("tissue_encoder_type", "cnn")
+        fusion_embed_dim = cfg["model"].get("fusion_embed_dim", 64)
+        fusion_reduction = cfg["model"].get("fusion_reduction", 4)
+        tissue_encoder_kwargs = cfg["model"].get("tissue_encoder_kwargs", None)
         model = CellViTWithTissue(
             tissue_fusion=tissue_fusion,
             use_compatibility_constraint=use_compat,
             nuclei_tissue_compatibility=compat_map,
+            fusion_warmup_epochs=fusion_warmup,
+            freeze_tissue_after_fusion_warmup=freeze_tissue,
+            tissue_encoder_type=tissue_encoder_type,
+            tissue_encoder_kwargs=tissue_encoder_kwargs,
+            fusion_embed_dim=fusion_embed_dim,
+            fusion_reduction=fusion_reduction,
             num_nuclei_classes=num_nuclei_classes,
             num_tissue_classes=num_tissue_classes,
             embed_dim=cfg["model"]["embed_dim"],
@@ -171,7 +213,9 @@ def main():
             num_heads=cfg["model"]["num_heads"],
             extract_layers=cfg["model"]["extract_layers"],
         )
-        print(f"Using CellViTWithTissue (fusion={tissue_fusion}, compat={use_compat})")
+        posthoc = cfg["model"].get("use_posthoc_constraint", False)
+        print(f"Using CellViTWithTissue (fusion={tissue_fusion}, compat={use_compat}, fusion_warmup={fusion_warmup},"
+              f" freeze_tissue={freeze_tissue}, posthoc_constraint={posthoc})")
     else:
         model = CellViT(
             num_nuclei_classes=num_nuclei_classes,
@@ -183,7 +227,6 @@ def main():
             extract_layers=cfg["model"]["extract_layers"],
         )
 
-    # load DINO pretrained weights
     ckpt = cfg["model"].get("encoder_pretrained", None)
     if ckpt is not None and os.path.exists(ckpt):
         load_vit_dino_pretrained(model, ckpt)
@@ -192,14 +235,13 @@ def main():
 
     if hasattr(torch, "compile"):
         try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print("Model compiled with torch.compile(mode='reduce-overhead')")
+            model = torch.compile(model, mode="max-autotune")
         except Exception as e:
             print(f"torch.compile not available, continuing without: {e}")
 
 
     nt_class_weights = dm.nt_class_weights(num_nuclei_classes)
-    print(f"NT class weights (inv-freq): {[f'{w:.3f}' for w in nt_class_weights]}")
+    print(f"NT class weights: {[f'{w:.3f}' for w in nt_class_weights]}")
 
     loss_cfg = cfg["loss"]
     shared_loss_kwargs = dict(
@@ -221,43 +263,49 @@ def main():
 
     ts_class_weights = None
     if use_tissue_branch:
-        ts_class_weights = dm.ts_class_weights(
-            num_tissue_classes,
-            ignore_classes=set(tissue_ignore_classes),
-        )
+        ts_class_weights = dm.ts_class_weights(num_tissue_classes, ignore_classes=set(tissue_ignore_classes))
         print(f"Tissue class weights: {[f'{w:.3f}' for w in ts_class_weights]}")
         loss_fn = CellViTTissueLoss(
             lambda_ts_ft=loss_cfg.get("lambda_ts_ft", 1.0),
             lambda_ts_dice=loss_cfg.get("lambda_ts_dice", 0.5),
             lambda_ts_ce=loss_cfg.get("lambda_ts_ce", 1.0),
-            num_tissue_classes=num_tissue_classes,
             tissue_ignore_classes=tissue_ignore_classes,
             ts_class_weights=ts_class_weights,
+            tissue_label_smoothing=loss_cfg.get("tissue_label_smoothing", 0.0),
+            tissue_dedup=loss_cfg.get("tissue_dedup", True),
+            tissue_use_focal=loss_cfg.get("tissue_use_focal", False),
+            tissue_focal_gamma=loss_cfg.get("tissue_focal_gamma", 2.0),
             **shared_loss_kwargs,
         )
     else:
         loss_fn = CellViTMultiTaskLoss(**shared_loss_kwargs)
     
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"]["wd"],
-        betas=cfg["train"].get("betas", (0.85, 0.95))
-    )
-    
+    tissue_lr = cfg["train"].get("tissue_lr", cfg["train"]["lr"])
+    tissue_wd = cfg["train"].get("tissue_wd", cfg["train"]["wd"])
+
+    if use_tissue_branch and hasattr(model, "tissue_encoder"):
+        tissue_params = set(id(p) for p in model.tissue_encoder.parameters())
+        base_params = [p for p in model.parameters() if id(p) not in tissue_params]
+        param_groups = [
+            {"params": base_params, "lr": cfg["train"]["lr"]},
+            {"params": list(model.tissue_encoder.parameters()),
+             "lr": tissue_lr, "weight_decay": tissue_wd},
+        ]
+        print(f"Optimizer: lr={cfg['train']['lr']}, tissue_lr={tissue_lr}")
+    else:
+        param_groups = model.parameters()
+
+    optim = torch.optim.AdamW(param_groups, lr=cfg["train"]["lr"], weight_decay=cfg["train"]["wd"], 
+                              betas=cfg["train"].get("betas", (0.85, 0.95)))
+
     scheduler_type = cfg["train"].get("scheduler_type", "exponential")
+    tissue_scheduler_gamma = cfg["train"].get("tissue_scheduler_gamma", cfg["train"].get("scheduler_gamma", 0.85))
     if scheduler_type == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optim,
-            T_max=cfg["train"]["epochs"],
-            eta_min=cfg["train"].get("scheduler_eta_min", 1e-5),
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=cfg["train"]["epochs"], 
+                                                               eta_min=cfg["train"].get("scheduler_eta_min", 1e-5))
         print(f"Using CosineAnnealingLR scheduler (eta_min={cfg['train'].get('scheduler_eta_min', 1e-5)})")
     else:
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            optim,
-            gamma=cfg["train"].get("scheduler_gamma", 0.85),
-        )
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=cfg["train"].get("scheduler_gamma", 0.85))
         print(f"Using ExponentialLR scheduler (gamma={cfg['train'].get('scheduler_gamma', 0.85)})")
 
     trainer = Trainer(
@@ -273,10 +321,11 @@ def main():
         early_stopping_patience=cfg["train"].get("early_stopping_patience", None),
         num_nuclei_classes=num_nuclei_classes,
         num_tissue_classes=num_tissue_classes,
-        unlabeled_class=unlabeled_class,
-        background_class=background_class,
-        ambiguous_classes=ambiguous_classes,
+        excluded_nuclei_classes=dm.cfg.excluded_nuclei_classes,
         tissue_ignore_classes=tissue_ignore_classes,
+        posthoc_compat_map=compat_map if cfg["model"].get("use_posthoc_constraint", False) else None,
+        use_tissue_branch=use_tissue_branch,
+        oracle_tissue_mode=cfg["model"].get("oracle_tissue_training", False),
     )
 
     run_id = args.run_id or uuid.uuid4().hex[:12]
@@ -289,7 +338,6 @@ def main():
     if args.checkpoint and os.path.exists(args.checkpoint):
         checkpoint_to_load = args.checkpoint
     else:
-        # auto-resume: look for latest_checkpoint.pth in output_dir
         auto_ckpt = output_dir / "latest_checkpoint.pth"
         if auto_ckpt.exists():
             ckpt_data = torch.load(str(auto_ckpt), map_location="cpu", weights_only=False)
@@ -298,12 +346,20 @@ def main():
                 checkpoint_to_load = str(auto_ckpt)
                 print(f"Auto-resume: found checkpoint with matching run_id={run_id}")
             else:
-                print(f"Checkpoint found but run_id mismatch (saved={saved_run_id}, current={run_id})\nStarting fresh")
+                print(f"Checkpoint found but run_id mismatch. Starting fresh")
             del ckpt_data
 
     if checkpoint_to_load:
-        start_epoch, best_pq, best_epoch = trainer.load_checkpoint(checkpoint_to_load)
-        print(f"Resuming from epoch {start_epoch}, best_pq={best_pq:.4f} (epoch {best_epoch})")
+        strict = not args.no_strict
+        start_epoch, best_pq, best_epoch = trainer.load_checkpoint(checkpoint_to_load, strict=strict)
+        if not strict:
+            start_epoch = 0
+            best_pq = 0.0
+            best_epoch = 0
+            trainer.reset_early_stopping()
+            print(f"Loaded weights (strict=False), training from epoch 0")
+        else:
+            print(f"Resuming from epoch {start_epoch}, best_pq={best_pq:.4f} (epoch {best_epoch})")
 
     wandb_id_file = output_dir / "wandb_run_id.txt"
     wandb_run_id = None
@@ -316,6 +372,7 @@ def main():
         id=wandb_run_id,
         resume="allow",
         config={
+            "experiment": experiment_name,
             "learning_rate": cfg["train"]["lr"],
             "weight_decay": cfg["train"]["wd"],
             "betas": cfg["train"].get("betas", (0.85, 0.95)),
@@ -327,11 +384,12 @@ def main():
             "use_mixed_precision": cfg["train"].get("use_mixed_precision", True),
             "use_weighted_sampler": cfg["data"]["use_weighted_sampler"],
             "gamma_s": cfg["data"].get("gamma_s", 0.85),
-            "fold": cfg["splits"]["fold"],
+            "split_mode": cfg["splits"].get("mode", "fold"),
+            "fold": cfg["splits"].get("fold", "dev"),
             "model": cfg["model"],
-            "loss_weights": cfg["loss"],
+            "loss_weights": cfg["loss"]
         },
-        name=f"fold_{cfg['splits']['fold']}",
+        name=f"{experiment_name}_{cfg['splits'].get('fold', 'dev')}"
     )
 
     wandb_id_file.write_text(wandb.run.id)
@@ -349,16 +407,20 @@ def main():
     log_image_interval = cfg["train"].get("log_image_interval", 10)
     print(f"Prediction images logged to wandb every {log_image_interval} epochs")
 
+    try:
+        from azureml.core import Run as _AzureRun
+        _ctx = _AzureRun.get_context()
+        azure_run = None if _ctx.id.startswith("OfflineRun") else _ctx
+    except Exception:
+        azure_run = None
+
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
         print(f"\nEpoch {epoch}/{cfg['train']['epochs']}")
         print(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
 
-        # train
         train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
 
         freeze_encoder_epochs = cfg["train"].get("freeze_encoder_epochs", 25)
-
-        # validate
         is_last_epoch = (epoch == cfg["train"]["epochs"] - 1)
         compute_full = (epoch % val_metric_interval == 0) or is_last_epoch
         val_metrics = trainer.val_epoch(val_loader, epoch=epoch, compute_full_metrics=compute_full)
@@ -369,8 +431,10 @@ def main():
             "epoch": epoch,
             "lr": scheduler.get_last_lr()[0],
             "train/loss": train_metrics['loss'],
-            "val/loss": val_metrics['loss'],
         }
+
+        if val_metrics:
+            metrics["val/loss"] = val_metrics['loss']
 
         for key, value in train_metrics.items():
             if key != 'loss':
@@ -386,32 +450,31 @@ def main():
             metrics["gpu/memory_allocated_gb"] = mem_allocated
             metrics["gpu/memory_reserved_gb"] = mem_reserved
 
-        if epoch % log_image_interval == 0:
+        if epoch % log_image_interval == 0 and len(val_loader) > 0:
             metrics.update(trainer.log_prediction_images(val_loader))
 
         wandb.log(metrics)
 
         print(f"\nEpoch {epoch}:")
-        print(f"  Train Loss: {train_metrics['loss']:.4f}")
-        print(f"  Val Loss: {val_metrics['loss']:.4f}")
-        if 'pq' in val_metrics:
-            print(f"  Val PQ: {val_metrics['pq']:.4f}")
-            print(f"  Val F1: {val_metrics['f1']:.4f}")
+        print(f"\tTrain Loss: {train_metrics['loss']:.4f}")
+        if val_metrics:
+            print(f"\tVal Loss: {val_metrics['loss']:.4f}")
+            if 'pq' in val_metrics:
+                print(f"\tVal PQ: {val_metrics['pq']:.4f}")
+                print(f"\tVal F1: {val_metrics['f1']:.4f}")
 
         pq_key = 'pq_class_avg' if 'pq_class_avg' in val_metrics else 'pq'
         if pq_key in val_metrics and val_metrics[pq_key] > best_pq:
             best_pq = val_metrics[pq_key]
             best_epoch = epoch
-            checkpoint_path = output_dir / "best_model.pth"
-            trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics, best_pq=best_pq, best_epoch=best_epoch, run_id=run_id)
+            checkpoint_path = best_output_dir / "best_model.pth"
+            trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics, best_pq=best_pq,
+                                    best_epoch=best_epoch, run_id=run_id, weights_only=True)
             print(f"  New best model with {pq_key}: {best_pq:.4f}")
 
         latest_path = output_dir / "latest_checkpoint.pth"
-        trainer.save_checkpoint(str(latest_path), epoch, val_metrics, best_pq=best_pq, best_epoch=best_epoch, run_id=run_id)
-
-        if (epoch + 1) % 10 == 0:
-            checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pth"
-            trainer.save_checkpoint(str(checkpoint_path), epoch, val_metrics, best_pq=best_pq, best_epoch=best_epoch, run_id=run_id)
+        trainer.save_checkpoint(str(latest_path), epoch, val_metrics, best_pq=best_pq,
+                                best_epoch=best_epoch, run_id=run_id)
 
         if epoch >= freeze_encoder_epochs and trainer.check_early_stopping(val_metrics):
             print(f"\nEarly stopping triggered at epoch {epoch}")

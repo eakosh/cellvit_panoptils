@@ -1,0 +1,129 @@
+
+# Two-stage: SMP tissue pretraining → frozen tissue + CellViT nuclei
+# with multi-level AFF fusion (no constraint — isolate fusion mechanism,
+# compare vs cross_attn_bottleneck).
+#
+# Phase 1: SMP (mit_b1 + UNet + ImageNet) for 5-class tissue.
+#   Reuse phase1_best.pth from prior run via --phase1-checkpoint.
+# Phase 2: CellViTWithTissue with tissue_fusion="multi_aff".
+#   Tissue encoder frozen → AFF channel-attention at b3, b2, b1.
+
+data:
+  root: "PanopTILs_data/BootstrapNucleiManualRegions_TCGA_05132021"
+  subset: "tcga"
+  batch_size: 16
+  num_workers: 4
+  cache_dataset: true
+  pin_memory: true
+  persistent_workers: true
+
+  use_weighted_sampler: true
+  gamma_s: 0.95
+
+  num_nuclei_classes: 10
+  num_tissue_classes: 5
+  nuclei_unlabeled_class: 0
+  nuclei_background_class: 9
+  nuclei_ambiguous_classes: [8]
+  tissue_ignore_classes: [0]
+  excluded_tissue_classes: [0, 8]
+  tissue_context_size: 512
+
+splits:
+  fold: 1
+
+# Phase 1: SMP tissue-only (skipped if checkpoint provided)
+phase1:
+  epochs: 70
+  data_overrides:
+    batch_size: 16
+    use_weighted_sampler: false
+    gamma_s: 1.0
+    tissue_dedup: true
+    tissue_strong_aug: true
+  loss:
+    lambda_ts_ft: 0.5
+    lambda_ts_dice: 0.0
+    lambda_ts_ce: 0.5
+    tissue_label_smoothing: 0.05
+    use_inv_freq_weights: true
+    ft_alpha: 0.3
+    ft_beta: 0.7
+    ft_gamma: 1.3333
+    ft_eps: 1.0e-6
+  train:
+    lr: 0.0002
+    wd: 0.0001
+    betas: [0.9, 0.999]
+    scheduler_type: cosine
+    scheduler_eta_min: 1.0e-6
+    use_mixed_precision: true
+    max_grad_norm: 1.0
+    early_stopping_patience: 15
+    val_metric_interval: 1
+    encoder_freeze_epochs: 5
+
+# Phase 2: CellViT nuclei + frozen SMP tissue + multi-level AFF
+phase2:
+  epochs: 130
+  loss:
+    lambda_np_ft: 1.0
+    lambda_np_dice: 1.0
+    lambda_hv_mse: 2.5
+    lambda_hv_msge: 8.0
+    lambda_nt_ft: 0.5
+    lambda_nt_dice: 0.2
+    lambda_nt_bce: 0.5
+    # Tissue OFF (frozen, no gradient through tissue encoder)
+    lambda_ts_ft: 0.0
+    lambda_ts_dice: 0.0
+    lambda_ts_ce: 0.0
+    lambda_tc_ce: 0.0
+    tissue_label_smoothing: 0.0
+    tissue_dedup: true
+    ft_alpha: 0.3
+    ft_beta: 0.3
+    ft_gamma: 1.3333
+    ft_eps: 1.0e-6
+  train:
+    lr: 0.0003
+    wd: 0.0001
+    betas: [0.85, 0.85]
+    tissue_lr: 0.0
+    tissue_wd: 0.0
+    scheduler_type: exponential
+    scheduler_gamma: 0.85
+    use_mixed_precision: true
+    gradient_accumulation_steps: 1
+    max_grad_norm: 1.0
+    freeze_encoder_epochs: 25
+    val_metric_interval: 5
+    log_image_interval: 10
+    early_stopping_patience: 15
+
+# ---------------- Model ----------------
+model:
+  embed_dim: 384
+  depth: 12
+  num_heads: 6
+  extract_layers: [3, 6, 9, 12]
+  encoder_pretrained: "weights/vit256_small_dino.pth"
+
+  use_tissue_branch: true
+  tissue_fusion: multi_aff   # ← AFF channel-attention at b3, b2, b1
+
+  tissue_encoder_type: smp
+  tissue_encoder_kwargs:
+    encoder_name: mit_b1
+    encoder_weights: imagenet
+    decoder: unet
+
+  fusion_reduction: 4
+
+  # No constraint — isolate fusion effect
+  use_compatibility_constraint: false
+  use_posthoc_constraint: false
+
+  # Tissue stays frozen after phase 1
+  fusion_warmup_epochs: 0
+  freeze_tissue_after_fusion_warmup: true

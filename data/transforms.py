@@ -1,4 +1,53 @@
 import albumentations as A
+import cv2
+import numpy as np
+
+
+_INTENSITY_AUGS = [
+    A.Blur(blur_limit=7, p=0.2),
+    A.GaussNoise(var_limit=(0.0, 50.0), p=0.25),
+    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.08, p=0.5),
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+    A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=15, p=0.3),
+]
+
+_TISSUE_INTENSITY_COMPOSE = A.Compose(_INTENSITY_AUGS)
+
+
+def get_tissue_context_aug(image, mask, py, px, tiles_per_side):
+    if np.random.random() < 0.5:  # horizontal flip
+        image = image[:, ::-1].copy()
+        mask = mask[:, ::-1].copy()
+        px = tiles_per_side - 1 - px
+    if np.random.random() < 0.5:  # vertical flip
+        image = image[::-1, :].copy()
+        mask = mask[::-1, :].copy()
+        py = tiles_per_side - 1 - py
+    k_rot = np.random.randint(0, 4)
+    if k_rot > 0:
+        image = np.rot90(image, k_rot).copy()
+        mask = np.rot90(mask, k_rot).copy()
+        for _ in range(k_rot):
+            py, px = tiles_per_side - 1 - px, py
+
+    image = _TISSUE_INTENSITY_COMPOSE(image=image)["image"]
+    return image, mask, py, px
+
+
+def get_tissue_context_aug_strong() -> A.Compose:
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.Affine(scale=(0.85, 1.15), translate_percent=0.05, rotate=(-15, 15),
+                 interpolation=cv2.INTER_LINEAR, mode=cv2.BORDER_REFLECT_101, p=0.4),
+        A.ElasticTransform(alpha=120, sigma=12, alpha_affine=10,
+                           interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_REFLECT_101,
+                           p=0.3),
+        A.Downscale(scale_min=0.5, scale_max=0.75,
+                    interpolation=cv2.INTER_LINEAR, p=0.15),
+        *_INTENSITY_AUGS,
+    ])
 
 
 def get_train_transforms(image_size: int = 256) -> A.Compose:

@@ -10,55 +10,55 @@ def compute_sampling_weights(
     patch_nuclei_classes: List[Set[int]],
     gamma_s: float = 0.85,
     ignore_nuclei_classes: Optional[Set[int]] = None,
+    patches_per_image: int = 16,
+    tissue_dedup_boost: float = 3.0,
 ) -> torch.Tensor:
-    
+
     if ignore_nuclei_classes is None:
         ignore_nuclei_classes = set()
 
-    N_train = len(patch_tissue_classes)
-    assert len(patch_nuclei_classes) == N_train, "Length mismatch"
+    n_patches = len(patch_tissue_classes)
+    assert len(patch_nuclei_classes) == n_patches, "Length mismatch"
 
     # tissue weights
     tissue_count = Counter(patch_tissue_classes)
-    w_tissue = np.array(
-        [N_train / (gamma_s * tissue_count[ct] + (1.0 - gamma_s) * N_train)
-         for ct in patch_tissue_classes],
-        dtype=np.float32,
-    )
+    w_tissue = np.array([n_patches / (gamma_s * tissue_count[ct] + (1.0 - gamma_s) * n_patches)
+                        for ct in patch_tissue_classes], dtype=np.float32)
     w_tissue_max = w_tissue.max()
-    w_tissue_norm = w_tissue / w_tissue_max if w_tissue_max > 0 else np.ones(N_train, dtype=np.float32)
+    w_tissue_norm = w_tissue / w_tissue_max if w_tissue_max > 0 else np.ones(n_patches, dtype=np.float32)
 
-    # сell weights
+    # cell weights
     filtered = [classes - ignore_nuclei_classes for classes in patch_nuclei_classes]
-    N_cell = sum(len(c) for c in filtered)
+    n_cells = sum(len(c) for c in filtered)
 
-    if N_cell == 0 or gamma_s == 0.0:
-        w_cell_norm = np.ones(N_train, dtype=np.float32)
+    if n_cells == 0 or gamma_s == 0.0:
+        w_cell_norm = np.ones(n_patches, dtype=np.float32)
     else:
         class_patch_count = Counter()
         for classes in filtered:
             for c in classes:
                 class_patch_count[c] += 1
 
-        class_factor = {
-            j: N_cell / (gamma_s * n_j + (1.0 - gamma_s) * N_cell)
-                for j, n_j in class_patch_count.items()
-        }
+        class_factor = {j: n_cells / (gamma_s * n_j + (1.0 - gamma_s) * n_cells)
+                for j, n_j in class_patch_count.items()}
 
-        w_cell = np.array(
-            [(1.0 - gamma_s) + gamma_s * sum(class_factor[j] for j in classes)
-                                                    for classes in filtered],
-            dtype=np.float32,
-        )
+        w_cell = np.array([(1.0 - gamma_s) + gamma_s * sum(class_factor[j] 
+                        for j in classes) for classes in filtered], dtype=np.float32)
         w_cell_max = w_cell.max()
-        w_cell_norm = w_cell / w_cell_max if w_cell_max > 0 else np.ones(N_train, dtype=np.float32)
+        w_cell_norm = w_cell / w_cell_max if w_cell_max > 0 else np.ones(n_patches, dtype=np.float32)
 
     p = w_tissue_norm + w_cell_norm
+
+    # boost patches with tissue
+    if tissue_dedup_boost > 1.0 and patches_per_image > 1:
+        for i in range(0, n_patches, patches_per_image):
+            p[i] *= tissue_dedup_boost
+
     return torch.tensor(p, dtype=torch.float32)
 
 
 class PatchWeightedRandomSampler(Sampler):
-    def __init__(self, weights: torch.Tensor, patches_per_image: int,
+    def __init__(self, weights: torch.Tensor, patches_per_image: int, 
                  num_samples: int, replacement: bool = True):
         self.weights = weights.float()
         self.patches_per_image = patches_per_image

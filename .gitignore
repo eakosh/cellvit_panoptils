@@ -9,3 +9,4 @@ azure/azure_config.json
 azure
 .amlignore
 doph
+checkpoints

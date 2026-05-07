@@ -1,11 +1,14 @@
 import os
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
 from typing import Dict
 
 from model.utils.post_proc_cellvit import DetectionCellPostProcessor
+from model.cellvit_panoptils import apply_posthoc_tissue_constraint
 from utils.metrics import MetricsAggregator, compute_tissue_dice
+from data.constants import NUCLEI_SUPERCLASS_MAP, TISSUE_CLASS_NAMES
 
 
 class EarlyStopping:
@@ -49,20 +52,26 @@ class Trainer:
         early_stopping_patience=None,
         num_nuclei_classes=10,
         num_tissue_classes=9,
-        unlabeled_class=None,
-        background_class=None,
-        ambiguous_classes=(),
+        excluded_nuclei_classes=(),
         centroid_radius=12.0,
         tissue_ignore_classes=None,
+        posthoc_compat_map=None,
+        tissue_class_names=None,
+        nuclei_superclass_map=None,
+        oracle_tissue_mode=False,
+        use_tissue_branch=False,
     ):
+        self.oracle_tissue_mode = oracle_tissue_mode
+        self.use_tissue_branch = use_tissue_branch
+        self.posthoc_compat_map = posthoc_compat_map
         self.num_tissue_classes = num_tissue_classes
         self.tissue_ignore_classes = set(tissue_ignore_classes) if tissue_ignore_classes else {0}
+        self.tissue_class_names = tissue_class_names if tissue_class_names is not None else TISSUE_CLASS_NAMES
         self.model = model.to(device)
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
-
         self.use_mixed_precision = use_mixed_precision
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.freeze_encoder_epochs = freeze_encoder_epochs
@@ -74,19 +83,13 @@ class Trainer:
         else:
             self.scaler = None
 
-        self.metrics_aggregator = MetricsAggregator(
-            num_classes=num_nuclei_classes,
-            unlabeled_class=unlabeled_class,
-            background_class=background_class,
-            ambiguous_classes=tuple(ambiguous_classes),
-            centroid_radius=centroid_radius,
-        )
-
-        self.cell_post_processor = DetectionCellPostProcessor(
-            nr_types=num_nuclei_classes,
-            magnification=40,
-            gt=False,
-        )
+        superclass_map = nuclei_superclass_map if nuclei_superclass_map is not None else NUCLEI_SUPERCLASS_MAP
+        self.metrics_aggregator = MetricsAggregator(num_classes=num_nuclei_classes, 
+                                                    excluded_nuclei_classes=excluded_nuclei_classes, 
+                                                    centroid_radius=centroid_radius,
+                                                    superclass_map=superclass_map)
+        self.cell_post_processor = DetectionCellPostProcessor(nr_types=num_nuclei_classes,
+                                                              magnification=40, gt=False)
 
         if early_stopping_patience is not None:
             self.early_stopping = EarlyStopping(patience=early_stopping_patience, mode="min")
@@ -95,30 +98,33 @@ class Trainer:
 
         self.current_epoch = 0
 
-    def freeze_encoder(self):
-        if hasattr(self.model, 'encoder'):
-            for layer_name, param in self.model.encoder.named_parameters():
-                if layer_name.split(".")[0] != "head":
-                    param.requires_grad = False
-        else:
-            print("Warning: Model doesn't have encoder attribute. Skipping freeze")
+
+    def freeze_encoder(self):    
+        for layer_name, param in self.model.encoder.named_parameters():
+            if layer_name.split(".")[0] != "head":
+                param.requires_grad = False
 
     def unfreeze_encoder(self):
-        if hasattr(self.model, 'encoder'):
-            for param in self.model.encoder.parameters():
-                param.requires_grad = True
-        else:
-            print("Warning: Model doesn't have encoder attribute. Skipping unfreeze")
+        for param in self.model.encoder.parameters():
+            param.requires_grad = True
+
 
     def set_epoch(self, epoch: int):
         self.current_epoch = epoch
+        model = self.model
+
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
+        if hasattr(model, 'set_epoch'):
+            model.set_epoch(epoch)
 
         if epoch < self.freeze_encoder_epochs:
             self.freeze_encoder()
         else:
-            if epoch == self.freeze_encoder_epochs:
-                print(f"\nEpoch {epoch}: Unfreezing encoder\n")
+            if epoch == self.freeze_encoder_epochs and self.freeze_encoder_epochs > 0:
+                print(f"\nUnfreezing encoder\n")
             self.unfreeze_encoder()
+
 
     def train_epoch(self, loader, epoch: int):
         self.set_epoch(epoch)
@@ -127,6 +133,7 @@ class Trainer:
         total_loss = 0.0
         loss_components = {}
         batch_count = 0
+        nan_batches = 0
 
         num_batches = len(loader)
         pbar = tqdm(loader, desc=f"Train Epoch {epoch}")
@@ -135,16 +142,33 @@ class Trainer:
             images = images.to(self.device, non_blocking=True)
             targets = {k: v.to(self.device, non_blocking=True) for k, v in targets.items()}
 
+            tissue_context = targets.pop("tissue_context", None)
+            crop_coords = targets.pop("crop_coords", None)
+
+            tissue_kwargs = {}
+            if self.use_tissue_branch and tissue_context is not None:
+                tissue_kwargs["tissue_context"] = tissue_context
+                tissue_kwargs["crop_coords"] = crop_coords
+            if self.oracle_tissue_mode and "tissue_mask" in targets:
+                tissue_kwargs["oracle_tissue"] = targets["tissue_mask"]
+
             # forward
             if self.use_mixed_precision:
                 with torch.amp.autocast('cuda'):
-                    outputs = self.model(images)
+                    outputs = self.model(images, **tissue_kwargs)
                     loss, loss_dict = self.loss_fn(outputs, targets)
                     loss = loss / self.gradient_accumulation_steps
             else:
-                outputs = self.model(images)
+                outputs = self.model(images, **tissue_kwargs)
                 loss, loss_dict = self.loss_fn(outputs, targets)
                 loss = loss / self.gradient_accumulation_steps
+
+            loss_value = loss.item()
+            if not np.isfinite(loss_value):
+                self.optimizer.zero_grad(set_to_none=True)
+                nan_batches += 1
+                pbar.set_postfix({'loss': 'NaN-skip'})
+                continue
 
             # backward
             if self.use_mixed_precision:
@@ -153,40 +177,41 @@ class Trainer:
                 loss.backward()
 
             # gradient accumulation
-            if ((batch_idx + 1) % self.gradient_accumulation_steps == 0
-                    or (batch_idx + 1) == num_batches):
+            if ((batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches):
                 if self.use_mixed_precision:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
                     self.optimizer.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
 
-            # loss
-            batch_loss = loss.item() * self.gradient_accumulation_steps
+            batch_loss = loss_value * self.gradient_accumulation_steps
             total_loss += batch_loss
             batch_count += 1
 
             for key, value in loss_dict.items():
+                if value != value:
+                    continue
                 if key not in loss_components:
                     loss_components[key] = 0.0
                 loss_components[key] += value
 
             pbar.set_postfix({'loss': f'{batch_loss:.4f}'})
 
+        if nan_batches > 0:
+            print(f"Warning: skipped {nan_batches}/{num_batches} NaN/Inf batches this epoch")
+            if nan_batches == num_batches:
+                raise RuntimeError(f"All {num_batches} batches were NaN/Inf. Model parameters corrupted")
+
         avg_loss = total_loss / max(1, batch_count)
         avg_loss_components = {k: v / max(1, batch_count) for k, v in loss_components.items()}
 
-        metrics = {
-            'loss': avg_loss,
-            **avg_loss_components
-        }
+        metrics = {'loss': avg_loss,
+                   **avg_loss_components}
 
         return metrics
 
@@ -199,7 +224,6 @@ class Trainer:
         total_loss = 0.0
         loss_components = {}
         batch_count = 0
-        
         tissue_acc = {}
         tissue_n = 0
 
@@ -209,21 +233,33 @@ class Trainer:
         for images, targets, names in pbar:
             images = images.to(self.device, non_blocking=True)
             targets = {k: v.to(self.device, non_blocking=True) for k, v in targets.items()}
+            tissue_context = targets.pop("tissue_context", None)
+            crop_coords = targets.pop("crop_coords", None)
+
+            tissue_kwargs = {}
+            if self.use_tissue_branch and tissue_context is not None:
+                tissue_kwargs["tissue_context"] = tissue_context
+                tissue_kwargs["crop_coords"] = crop_coords
+            if self.oracle_tissue_mode and "tissue_mask" in targets:
+                tissue_kwargs["oracle_tissue"] = targets["tissue_mask"]
 
             # forward
             if self.use_mixed_precision:
                 with torch.amp.autocast('cuda'):
-                    outputs = self.model(images)
+                    outputs = self.model(images, **tissue_kwargs)
                     loss, loss_dict = self.loss_fn(outputs, targets)
             else:
-                outputs = self.model(images)
+                outputs = self.model(images, **tissue_kwargs)
                 loss, loss_dict = self.loss_fn(outputs, targets)
 
             batch_loss = loss.item()
-            total_loss += batch_loss
-            batch_count += 1
+            if not (batch_loss != batch_loss):
+                total_loss += batch_loss
+                batch_count += 1
 
             for key, value in loss_dict.items():
+                if value != value:
+                    continue
                 if key not in loss_components:
                     loss_components[key] = 0.0
                 loss_components[key] += value
@@ -232,31 +268,42 @@ class Trainer:
                 pred_instances = self._extract_instances_hv(outputs)
                 gt_instances = targets['instance_map'].cpu().numpy()
 
-                pred_type = torch.argmax(outputs['nuclei_type_map'], dim=1).cpu().numpy()
+                pred_type_probs_full = torch.softmax(outputs['nuclei_type_map'], dim=1).float().cpu().numpy()
+                pred_type = pred_type_probs_full.argmax(axis=1)
                 gt_type = targets['nuclei_type_map'].cpu().numpy()
                 pred_binary = (torch.softmax(outputs['nuclei_binary_map'], dim=1)[:, 1] > 0.5).cpu().numpy().astype(np.uint8)
                 gt_binary = targets['nuclei_binary_map'].cpu().numpy().astype(np.uint8)
 
-                for i in range(pred_instances.shape[0]):
-                    self.metrics_aggregator.update(
-                        pred_instances[i],
-                        gt_instances[i],
-                        pred_binary=pred_binary[i],
-                        gt_binary=gt_binary[i],
-                        pred_type_map=pred_type[i],
-                        gt_type_map=gt_type[i],
-                    )
+                if self.posthoc_compat_map and 'tissue_segmentation_map' in outputs:
+                    nt_logits = outputs['nuclei_type_map'].cpu().numpy()
+                    tissue_pred = torch.argmax(outputs['tissue_segmentation_map'], dim=1).cpu().numpy()
+                    for i in range(pred_instances.shape[0]):
+                        pred_type[i] = apply_posthoc_tissue_constraint(pred_type[i], pred_instances[i], 
+                                                                       tissue_pred[i], nt_logits[i], 
+                                                                       self.posthoc_compat_map)
 
-                # tissue dice
-                if "tissue_segmentation_map" in outputs:
-                    pred_t = torch.argmax(outputs["tissue_segmentation_map"], dim=1).cpu().numpy()
-                    gt_t = targets["tissue_mask"].cpu().numpy()
+                for i in range(pred_instances.shape[0]):
+                    self.metrics_aggregator.update(pred_instances[i], 
+                                                   gt_instances[i], 
+                                                   pred_binary=pred_binary[i], 
+                                                   gt_binary=gt_binary[i], 
+                                                   pred_type_map=pred_type[i], 
+                                                   gt_type_map=gt_type[i], 
+                                                   pred_type_probs=pred_type_probs_full[i])
+
+                ts_key = "tissue_segmentation_map_full" if "tissue_segmentation_map_full" in outputs else "tissue_segmentation_map"
+                gt_key = "tissue_mask_context" if "tissue_mask_context" in targets else "tissue_mask"
+                if ts_key in outputs:
+                    pred_tensor = torch.argmax(outputs[ts_key], dim=1)
+                    gt_tensor = targets[gt_key]
+                    if gt_tensor.shape[-2:] != pred_tensor.shape[-2:]:
+                        gt_tensor = F.interpolate(gt_tensor.unsqueeze(1).float(), size=pred_tensor.shape[-2:], 
+                                                  mode='nearest').squeeze(1).long()
+                    pred_t = pred_tensor.cpu().numpy()
+                    gt_t = gt_tensor.cpu().numpy()
                     for i in range(pred_t.shape[0]):
-                        td = compute_tissue_dice(
-                            pred_t[i], gt_t[i],
-                            num_classes=self.num_tissue_classes,
-                            ignore_classes=self.tissue_ignore_classes,
-                        )
+                        td = compute_tissue_dice(pred_t[i], gt_t[i], num_classes=self.num_tissue_classes, 
+                                                 ignore_classes=self.tissue_ignore_classes)
                         for k, v in td.items():
                             tissue_acc[k] = tissue_acc.get(k, 0.0) + v
                         tissue_n += 1
@@ -266,41 +313,48 @@ class Trainer:
         avg_loss = total_loss / max(1, batch_count)
         avg_loss_components = {k: v / max(1, batch_count) for k, v in loss_components.items()}
 
-        metrics = {
-            'loss': avg_loss,
-            **avg_loss_components,
-        }
+        metrics = {'loss': avg_loss,
+                   **avg_loss_components}
 
         if compute_full_metrics:
             val_metrics = self.metrics_aggregator.compute()
             metrics.update(val_metrics)
-            print(f"\nValidation Metrics - {self.metrics_aggregator}\n")
+            print(f"\nValidation metrics: {self.metrics_aggregator}\n")
 
             if tissue_n > 0 and "mean" in tissue_acc:
                 metrics["tissue_dice"] = tissue_acc["mean"] / tissue_n
+                tissue_named = []
                 for c in range(1, self.num_tissue_classes):
                     if c in tissue_acc:
-                        metrics[f"tissue_dice_class_{c}"] = tissue_acc[c] / tissue_n
+                        dice_c = tissue_acc[c] / tissue_n
+                        metrics[f"tissue_dice_class_{c}"] = dice_c
+                        name = self.tissue_class_names.get(c)
+                        if name:
+                            metrics[f"tissue_dice_{name}"] = dice_c
+                            tissue_named.append(f"{name}={dice_c:.3f}")
+                if tissue_named:
+                    print(f"Tissue dice: mean={metrics['tissue_dice']:.3f}  " + "  ".join(tissue_named))
 
         return metrics
+    
 
     def _extract_instances_hv(self, outputs: Dict[str, torch.Tensor]) -> np.ndarray:
         binary_pred = torch.softmax(outputs['nuclei_binary_map'], dim=1)
-        type_pred = torch.argmax(outputs['nuclei_type_map'], dim=-1) if outputs['nuclei_type_map'].dim() == 3 \
-            else torch.argmax(outputs['nuclei_type_map'], dim=1)
-        hv_pred = outputs['hv_map']
 
+        if outputs['nuclei_type_map'].dim() == 3:
+            type_pred = torch.argmax(outputs['nuclei_type_map'], dim=-1)
+        else:
+            type_pred = torch.argmax(outputs['nuclei_type_map'], dim=1)
+
+        hv_pred = outputs['hv_map']
         batch_size = binary_pred.shape[0]
         instance_maps = []
 
         for i in range(batch_size):
-            # pred_map: [H, W, 4] = [type, binary_prob, hv_x, hv_y]
-            pred_map = np.concatenate([
-                type_pred[i].detach().cpu().numpy()[..., None],                    
-                binary_pred[i, 1].detach().cpu().numpy()[..., None],               
-                hv_pred[i, 0].detach().cpu().numpy()[..., None],                   
-                hv_pred[i, 1].detach().cpu().numpy()[..., None],                   
-            ], axis=-1)
+            pred_map = np.concatenate([type_pred[i].detach().cpu().numpy()[..., None],                    
+                                        binary_pred[i, 1].detach().cpu().numpy()[..., None],               
+                                        hv_pred[i, 0].detach().cpu().numpy()[..., None],                   
+                                        hv_pred[i, 1].detach().cpu().numpy()[..., None]], axis=-1)
 
             instance_map, _ = self.cell_post_processor.post_process_cell_segmentation(pred_map)
             instance_maps.append(instance_map)
@@ -321,35 +375,43 @@ class Trainer:
         images = images.to(self.device, non_blocking=True)
         targets = {k: v.to(self.device, non_blocking=True) for k, v in targets.items()}
 
+        tissue_context = targets.pop("tissue_context", None)
+        crop_coords = targets.pop("crop_coords", None)
+
+        tissue_kwargs = {}
+        if self.use_tissue_branch and tissue_context is not None:
+            tissue_kwargs["tissue_context"] = tissue_context
+            tissue_kwargs["crop_coords"] = crop_coords
+        if self.oracle_tissue_mode and "tissue_mask" in targets:
+            tissue_kwargs["oracle_tissue"] = targets["tissue_mask"]
+
         n_samples = min(n_samples, images.shape[0])
 
         if self.use_mixed_precision:
             with torch.amp.autocast('cuda'):
-                outputs = self.model(images)
+                outputs = self.model(images, **tissue_kwargs)
         else:
-            outputs = self.model(images)
+            outputs = self.model(images, **tissue_kwargs)
 
-        # binary
         pred_binary = torch.softmax(outputs['nuclei_binary_map'], dim=1)[:, 1].cpu().numpy()
         pred_type = torch.argmax(outputs['nuclei_type_map'], dim=1).cpu().numpy()
-        pred_hv = outputs['hv_map'].cpu().numpy()  # [B, 2, H, W]
+        pred_hv = outputs['hv_map'].cpu().numpy()
 
         gt_binary = targets['nuclei_binary_map'].cpu().numpy().astype(np.float32)
         gt_type = targets['nuclei_type_map'].cpu().numpy()
-        gt_hv = targets['hv_map'].cpu().numpy()  # [B, 2, H, W]
+        gt_hv = targets['hv_map'].cpu().numpy()
 
-        # tissue segmentation
         has_tissue = "tissue_segmentation_map" in outputs
         if has_tissue:
             pred_tissue = torch.argmax(outputs['tissue_segmentation_map'], dim=1).cpu().numpy()
             gt_tissue = targets['tissue_mask'].cpu().numpy()
 
-        # denormalize images
-        imgs_np = images.cpu().numpy()  # [B, C, H, W]
+        # denormalize
+        imgs_np = images.cpu().numpy()
         imgs_np = np.clip(imgs_np * 0.5 + 0.5, 0, 1)
-        imgs_np = (imgs_np * 255).astype(np.uint8).transpose(0, 2, 3, 1)  # [B, H, W, C]
+        imgs_np = (imgs_np * 255).astype(np.uint8).transpose(0, 2, 3, 1)
 
-        # discrete colormaps
+        # colormaps
         n_cls = self.num_nuclei_classes
         type_cmap = plt.cm.get_cmap('tab10', n_cls)
         type_norm = mcolors.BoundaryNorm(np.arange(n_cls + 1) - 0.5, n_cls)
@@ -366,10 +428,10 @@ class Trainer:
             fig.suptitle(f"Sample: {name}", fontsize=10)
 
             for row_idx, row_label in enumerate(["GT", "Pred"]):
-                binary  = gt_binary[i]  if row_idx == 0 else pred_binary[i]
-                typ     = gt_type[i]    if row_idx == 0 else pred_type[i]
-                hv_h    = gt_hv[i, 0]   if row_idx == 0 else pred_hv[i, 0]
-                hv_v    = gt_hv[i, 1]   if row_idx == 0 else pred_hv[i, 1]
+                binary = gt_binary[i] if row_idx == 0 else pred_binary[i]
+                typ = gt_type[i] if row_idx == 0 else pred_type[i]
+                hv_h = gt_hv[i, 0] if row_idx == 0 else pred_hv[i, 0]
+                hv_v = gt_hv[i, 1] if row_idx == 0 else pred_hv[i, 1]
 
                 axes[row_idx, 0].imshow(imgs_np[i])
                 axes[row_idx, 0].set_title(f"{row_label} Input", fontsize=8)
@@ -395,46 +457,66 @@ class Trainer:
             plt.close(fig)
 
         return {"images": wandb_images}
+    
+
+    def reset_early_stopping(self):
+        if self.early_stopping is not None:
+            self.early_stopping.counter = 0
+            self.early_stopping.best_score = None
+            self.early_stopping.should_stop = False
 
     def check_early_stopping(self, val_metrics: Dict[str, float]) -> bool:
         if self.early_stopping is None:
             return False
         return self.early_stopping.step(val_metrics['loss'])
+    
 
-    def save_checkpoint(self, path: str, epoch: int, val_metrics: Dict[str, float], best_pq: float = 0.0, best_epoch: int = 0, run_id: str = None):
+    def save_checkpoint(self, path: str, epoch: int, val_metrics: Dict[str, float], 
+                        best_pq: float = 0.0, best_epoch: int = 0, run_id: str = None, 
+                        session_id: str = None, weights_only: bool = False):
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
             'val_metrics': val_metrics,
             'best_pq': best_pq,
-            'best_epoch': best_epoch,
+            'best_epoch': best_epoch
         }
         if run_id is not None:
             checkpoint['run_id'] = run_id
+        if session_id is not None:
+            checkpoint['session_id'] = session_id
 
-        if self.scaler is not None:
-            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-
-        if self.scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-
-        if self.early_stopping is not None:
-            checkpoint['early_stopping_state'] = {
-                'counter': self.early_stopping.counter,
-                'best_score': self.early_stopping.best_score,
-                'should_stop': self.early_stopping.should_stop,
-            }
+        if not weights_only:
+            checkpoint['optimizer_state_dict'] = self.optimizer.state_dict()
+            if self.scaler is not None:
+                checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+            if self.scheduler is not None:
+                checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+            if self.early_stopping is not None:
+                checkpoint['early_stopping_state'] = {
+                    'counter': self.early_stopping.counter,
+                    'best_score': self.early_stopping.best_score,
+                    'should_stop': self.early_stopping.should_stop,
+                }
 
         tmp_path = path + ".tmp"
         torch.save(checkpoint, tmp_path)
         os.replace(tmp_path, path)
         print(f"Checkpoint saved to {path}")
 
-    def load_checkpoint(self, path: str):
+    def load_checkpoint(self, path: str, strict: bool = True):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        missing, unexpected = self.model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+        if missing:
+            print(f"Checkpoint: {len(missing)} missing keys:")
+            for k in missing:
+                print(f"  + {k}")
+        if unexpected:
+            print(f"Checkpoint: {len(unexpected)} unexpected keys:")
+            for k in unexpected:
+                print(f"  - {k}")
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         if self.scaler is not None and 'scaler_state_dict' in checkpoint:

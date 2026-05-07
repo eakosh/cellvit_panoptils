@@ -1,4 +1,5 @@
-experiment: "baseline"
+
+experiment: "tissue_decoder_cross_attn"
 
 data:
   root: "PanopTILs_data/BootstrapNucleiManualRegions_TCGA_05132021"
@@ -10,7 +11,7 @@ data:
   persistent_workers: true
 
   use_weighted_sampler: true
-  gamma_s: 0.95    
+  gamma_s: 0.95
 
   num_nuclei_classes: 10
   num_tissue_classes: 5
@@ -19,17 +20,6 @@ data:
   nuclei_ambiguous_classes: [8]
   tissue_ignore_classes: [0]
   excluded_tissue_classes: [0, 8]
-  tissue_context_size: 512
-
-  nuclei_tissue_compatibility:
-    1: [1]
-    2: [2, 3]
-    3: [2, 3]
-    4: [2, 3]
-    5: [2, 3]
-    6: [1]
-    7: [4]
-    9: [1, 2, 3, 4]
 
 splits:
   fold: 1
@@ -40,35 +30,37 @@ model:
   num_heads: 6
   extract_layers: [3, 6, 9, 12]
   encoder_pretrained: "weights/vit256_small_dino.pth"
-  use_tissue_branch: false
-  tissue_fusion: false
+  use_tissue_branch: true
+  tissue_fusion: "cross_attn_bottleneck"
+  tissue_encoder_type: "shared"       # tissue decoder shares the ViT backbone
+  fusion_warmup_epochs: 10            # train tissue decoder alone first 10 epochs
+  use_compatibility_constraint: false
 
 loss:
-  # binary branch
   lambda_np_ft: 1.0
   lambda_np_dice: 1.0
 
-  # HV map branch
   lambda_hv_mse: 2.5
   lambda_hv_msge: 8.0
 
-  # nuclear type branch 
   lambda_nt_ft: 0.5
   lambda_nt_dice: 0.2
   lambda_nt_bce: 0.5
 
-  # tissue classification (global CLS token)  
+  lambda_ts_ft: 1.0
+  lambda_ts_dice: 0.5
+  lambda_ts_ce: 1.0
+
   lambda_tc_ce: 0.0
 
-  # Focal Tversky hyperparameters
   ft_alpha: 0.7
   ft_beta: 0.3
   ft_gamma: 1.3333   # 4/3
   ft_eps: 1.0e-6
 
 train:
-  lr: 0.0003           
-  wd: 0.0001           
+  lr: 0.0003
+  wd: 0.0001
   betas: [0.85, 0.85]  
 
   epochs: 130

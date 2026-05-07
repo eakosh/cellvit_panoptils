@@ -1,7 +1,7 @@
 import os
 from collections import Counter
 from dataclasses import dataclass
-from typing import Callable, Optional, Dict, List, Tuple
+from typing import Callable, Optional, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,7 +10,11 @@ from torch.utils.data import Dataset
 from PIL import Image
 import cv2
 
+from data.transforms import get_tissue_context_aug, get_tissue_context_aug_strong
 from utils.hv_map import gen_instance_hv_map
+
+
+_tissue_context_aug_strong = get_tissue_context_aug_strong()
 
 
 @dataclass
@@ -30,26 +34,35 @@ class PanopTILsDataset(Dataset):
         cache_dataset: bool = False,
         include_tissue_label: bool = True,
         cache_hv_maps: bool = False,
+        apply_tissue_aug: bool = False,
         unlabeled_class: Optional[int] = None,
         background_class: Optional[int] = None,
-        ambiguous_classes: Optional[List[int]] = None,
+        excluded_nuclei_classes: Optional[Set[int]] = None,
+        excluded_tissue_classes: Optional[List[int]] = None,
+        tissue_context_size: int = 512,
+        tissue_strong_aug: bool = False,
+        tissue_remap: Optional[Dict[int, int]] = None,
     ):
         self.paths = paths
         self.transforms = transforms
         self.cache_dataset = cache_dataset
         self.include_tissue_label = include_tissue_label
         self.cache_hv_maps = cache_hv_maps
+        self.apply_tissue_aug = apply_tissue_aug
         self.unlabeled_class = unlabeled_class
         self.background_class = background_class
-        self.ambiguous_classes = set(ambiguous_classes) if ambiguous_classes else set()
+        self._excluded_nuclei_classes: Set[int] = set(excluded_nuclei_classes) if excluded_nuclei_classes else set()
+        self._excluded_tissue_classes: Set[int] = set(excluded_tissue_classes) if excluded_tissue_classes else set()
+        self.tissue_context_size = tissue_context_size
+        self.tissue_strong_aug = tissue_strong_aug
+        self.tissue_remap = tissue_remap
+        self._tissue_remap_lut = None
+        if self.tissue_remap:
+            max_old = max(int(k) for k in self.tissue_remap.keys())
+            self._tissue_remap_lut = np.zeros(max_old + 1, dtype=np.int32)
+            for old, new in self.tissue_remap.items():
+                self._tissue_remap_lut[int(old)] = int(new)
 
-        # classes to remap, unlabeled for nuclei that have instance but unreliable type
-        self._remap_to_unlabeled: set = set()
-        if unlabeled_class is not None:
-            self._remap_to_unlabeled.add(unlabeled_class)
-        if background_class is not None:
-            self._remap_to_unlabeled.add(background_class)
-        self._remap_to_unlabeled.update(self.ambiguous_classes)
         self._hv_cache: Dict[int, np.ndarray] = {}
 
         self.rgb_dir = os.path.join(paths.root, paths.subset, "rgbs")
@@ -74,7 +87,6 @@ class PanopTILsDataset(Dataset):
         self.meta = {}
         self.tissue_pixel_counts: Counter = Counter()
         if self.include_tissue_label:
-            print("Computing patch-level tissue and nuclei classes from masks...")
             for f in self.files:
                 base = os.path.splitext(f)[0]
                 mask_path = os.path.join(self.mask_dir, base + ".png")
@@ -83,12 +95,13 @@ class PanopTILsDataset(Dataset):
                     try:
                         mask = np.array(Image.open(mask_path))
 
-                        tissue_mask = mask[:, :, 0]
+                        tissue_mask = mask[:, :, 0].astype(np.int32)
+                        if self._tissue_remap_lut is not None:
+                            tissue_mask = self._tissue_remap_lut[tissue_mask]
                         nuclei_type_mask = mask[:, :, 1]
 
-                        # accumulate pixel-level tissue class frequencies
-                        vals, cnts = np.unique(tissue_mask, return_counts=True)
-                        for v, c in zip(vals, cnts):
+                        vals, counts = np.unique(tissue_mask, return_counts=True)
+                        for v, c in zip(vals, counts):
                             self.tissue_pixel_counts[int(v)] += int(c)
 
                         patch_classes = []
@@ -101,12 +114,12 @@ class PanopTILsDataset(Dataset):
 
                             patch_nuc = nuclei_type_mask[y0:y0 + self.PATCH_SIZE, x0:x0 + self.PATCH_SIZE]
                             classes = {int(c) for c in np.unique(patch_nuc)
-                                       if int(c) not in self._remap_to_unlabeled}
+                                       if int(c) not in self._excluded_nuclei_classes}
                             patch_classes.append(classes)
 
                             patch_tis = tissue_mask[y0:y0 + self.PATCH_SIZE, x0:x0 + self.PATCH_SIZE]
                             u_t, c_t = np.unique(patch_tis, return_counts=True)
-                            valid_t = (u_t != 0) & (u_t != 8)
+                            valid_t = ~np.isin(u_t, list(self._excluded_tissue_classes))
                             if np.any(valid_t):
                                 patch_tissue_class = int(u_t[valid_t][c_t[valid_t].argmax()])
                             else:
@@ -133,16 +146,25 @@ class PanopTILsDataset(Dataset):
         self._cache_tissue_masks: Dict[int, np.ndarray] = {}
         self._cache_nuclei_masks: Dict[int, np.ndarray] = {}
         self._cache_instance_maps: Dict[int, np.ndarray] = {}
+        self._cache_tissue_context: Dict[int, np.ndarray] = {}
+        self._cache_tissue_mask_context: Dict[int, np.ndarray] = {}
 
-        # preload everything into memory 
         if self.cache_dataset:
-            print(f"Preloading {len(self.files)} images into memory...")
+            print(f"Preloading {len(self.files)} images into memory")
             for i in range(len(self.files)):
                 self._cache_imgs[i] = self._load_image(i)
                 tissue, nuclei = self._load_mask(i)
                 self._cache_tissue_masks[i] = tissue
                 self._cache_nuclei_masks[i] = nuclei
                 self._cache_instance_maps[i] = self._load_instance_map_from_csv(i, tissue.shape)
+                self._cache_tissue_context[i] = cv2.resize(
+                    self._cache_imgs[i], (self.tissue_context_size, self.tissue_context_size),
+                    interpolation=cv2.INTER_AREA,
+                )
+                self._cache_tissue_mask_context[i] = cv2.resize(
+                    tissue.astype(np.uint8), (self.tissue_context_size, self.tissue_context_size),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(np.int32)
                 self._cached.add(i)
             print("Preloading complete")
 
@@ -164,7 +186,10 @@ class PanopTILsDataset(Dataset):
         # channel 1: nuclei 
         tissue_mask = mask[:, :, 0].astype(np.int32)
         nuclei_mask = mask[:, :, 1].astype(np.int32)
-    
+
+        if self._tissue_remap_lut is not None:
+            tissue_mask = self._tissue_remap_lut[tissue_mask]
+
         return tissue_mask, nuclei_mask
 
     def _load_instance_map_from_csv(self, img_idx: int, img_shape: Tuple[int, int]) -> np.ndarray:
@@ -188,7 +213,6 @@ class PanopTILsDataset(Dataset):
                 points = np.array([[x, y] for x, y in zip(coords_x, coords_y)], dtype=np.int32)
 
                 cv2.fillPoly(instance_map, [points], inst_id)
-
         except Exception:
             pass
 
@@ -236,11 +260,29 @@ class PanopTILsDataset(Dataset):
             mask = instance_map > 0
             instance_map[mask] = lut[instance_map[mask]]
 
+        if (self.cache_dataset and img_idx in self._cached 
+            and img_idx in self._cache_tissue_context):
+            tissue_context = self._cache_tissue_context[img_idx].copy()
+            tissue_mask_context = self._cache_tissue_mask_context[img_idx].copy()
+        else:
+            full_img = (self._cache_imgs[img_idx] 
+                        if (self.cache_dataset and img_idx in self._cached) 
+                        else self._load_image(img_idx))
+            tissue_context = cv2.resize(full_img, 
+                                        (self.tissue_context_size, self.tissue_context_size), 
+                                        interpolation=cv2.INTER_AREA)
+            full_tissue = (self._cache_tissue_masks[img_idx] 
+                           if (self.cache_dataset and img_idx in self._cached) 
+                           else self._load_mask(img_idx)[0])
+            tissue_mask_context = cv2.resize(full_tissue.astype(np.uint8),
+                                          (self.tissue_context_size, self.tissue_context_size),
+                                          interpolation=cv2.INTER_NEAREST).astype(np.int32)
+
         nuclei_type_map = nuclei_mask.copy()
         if self.background_class is not None:
             nuclei_type_map[instance_map == 0] = self.background_class
-        if self.unlabeled_class is not None and self._remap_to_unlabeled:
-            untyped = (instance_map > 0) & np.isin(nuclei_mask, list(self._remap_to_unlabeled))
+        if self.unlabeled_class is not None and self._excluded_nuclei_classes:
+            untyped = (instance_map > 0) & np.isin(nuclei_mask, list(self._excluded_nuclei_classes))
             nuclei_type_map[untyped] = self.unlabeled_class
 
         if self.transforms is not None:
@@ -256,7 +298,6 @@ class PanopTILsDataset(Dataset):
 
         nuclei_binary_map = (instance_map > 0).astype(np.int32)
 
-        # for validation set deterministic transforms
         if self.cache_hv_maps and idx in self._hv_cache:
             hv_map = self._hv_cache[idx]
         else:
@@ -271,12 +312,31 @@ class PanopTILsDataset(Dataset):
             img_t = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
             img_t = (img_t - 0.5) / 0.5
 
+        if self.apply_tissue_aug:
+            if self.tissue_strong_aug:
+                aug = _tissue_context_aug_strong(
+                    image=tissue_context,
+                    mask=tissue_mask_context.astype(np.int32),
+                )
+                tissue_context = aug["image"]
+                tissue_mask_context = aug["mask"].astype(np.int32)
+            else:
+                tissue_context, tissue_mask_context, py, px = get_tissue_context_aug(
+                    tissue_context, tissue_mask_context, py, px, self.tiles_per_side,
+                )
+        tissue_context_t = torch.from_numpy(tissue_context).float().permute(2, 0, 1) / 255.0
+        tissue_context_t = (tissue_context_t - 0.5) / 0.5
+
         targets = {
             "tissue_mask": torch.from_numpy(np.ascontiguousarray(tissue_mask)).long(),
+            "tissue_mask_context": torch.from_numpy(np.ascontiguousarray(tissue_mask_context)).long(),
             "instance_map": torch.from_numpy(np.ascontiguousarray(instance_map)).long(),
             "nuclei_type_map": torch.from_numpy(np.ascontiguousarray(nuclei_type_map)).long(),
             "nuclei_binary_map": torch.from_numpy(np.ascontiguousarray(nuclei_binary_map)).long(),
             "hv_map": torch.from_numpy(np.ascontiguousarray(hv_map)).float(),
+            "tissue_context": tissue_context_t,
+            "crop_coords": torch.tensor([py, px], dtype=torch.long),
+            "patch_idx": torch.tensor(patch_idx, dtype=torch.long),
         }
 
         name = self.files[img_idx]
