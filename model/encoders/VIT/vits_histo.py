@@ -1,4 +1,14 @@
 # -*- coding: utf-8 -*-
+# Copyright © 2024 Fabian Hörst, Jens Kleesiek (original CellViT code).
+# Copyright © 2025 Olena Kosharova, FIIT STU (modifications).
+#
+# Licensed under the Apache License 2.0 with the Commons Clause restriction.
+# See the LICENSE file in the project root for full terms.
+#
+# NOTICE: This file has been modified from the original CellViT source
+# (https://github.com/TIO-IKIM/CellViT) as part of the
+# "Tissue-Context CellViT Extension" bachelor's thesis work.
+
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,12 +1,8 @@
+# Copyright © 2025 Olena Kosharova, FIIT STU.
+# Part of the "Tissue-Context CellViT Extension" (bachelor's thesis).
+# Licensed under the Apache License 2.0 with the Commons Clause restriction.
+# See the LICENSE file in the project root for full terms.
 
-# Two-stage: SMP tissue pretraining → frozen tissue + CellViT nuclei
-# with multi-level AFF fusion (no constraint — isolate fusion mechanism,
-# compare vs cross_attn_bottleneck).
-#
-# Phase 1: SMP (mit_b1 + UNet + ImageNet) for 5-class tissue.
-#   Reuse phase1_best.pth from prior run via --phase1-checkpoint.
-# Phase 2: CellViTWithTissue with tissue_fusion="multi_aff".
-#   Tissue encoder frozen → AFF channel-attention at b3, b2, b1.
 
 data:
   root: "PanopTILs_data/BootstrapNucleiManualRegions_TCGA_05132021"
@@ -63,7 +59,7 @@ phase1:
     val_metric_interval: 1
     encoder_freeze_epochs: 5
 
-# Phase 2: CellViT nuclei + frozen SMP tissue + multi-level AFF
+# Phase 2: CellViT nuclei 
 phase2:
   epochs: 130
   loss:
@@ -74,7 +70,6 @@ phase2:
     lambda_nt_ft: 0.5
     lambda_nt_dice: 0.2
     lambda_nt_bce: 0.5
-    # Tissue OFF (frozen, no gradient through tissue encoder)
     lambda_ts_ft: 0.0
     lambda_ts_dice: 0.0
     lambda_ts_ce: 0.0
@@ -101,7 +96,6 @@ phase2:
     log_image_interval: 10
     early_stopping_patience: 15
 
-# ---------------- Model ----------------
 model:
   embed_dim: 384
   depth: 12
@@ -110,7 +104,7 @@ model:
   encoder_pretrained: "weights/vit256_small_dino.pth"
 
   use_tissue_branch: true
-  tissue_fusion: multi_aff   # ← AFF channel-attention at b3, b2, b1
+  tissue_fusion: multi_aff 
 
   tissue_encoder_type: smp
   tissue_encoder_kwargs:
@@ -120,10 +114,8 @@ model:
 
   fusion_reduction: 4
 
-  # No constraint — isolate fusion effect
   use_compatibility_constraint: false
   use_posthoc_constraint: false
 
-  # Tissue stays frozen after phase 1
   fusion_warmup_epochs: 0
   freeze_tissue_after_fusion_warmup: true

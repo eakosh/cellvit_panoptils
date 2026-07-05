@@ -10,3 +10,4 @@ azure
 .amlignore
 doph
 checkpoints
+figures

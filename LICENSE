@@ -28,13 +28,37 @@ License: Apache License 2.0, modified by the Commons Clause and attribution term
 Commons Clause Restriction (Original Code)  
 You may not sell, rent, or commercially exploit the Original Code without explicit written permission from Fabian Hörst and Jens Kleesiek.  
 
-Required Attribution:  
-If any part of this work is used, you must cite:  
-If any parts of this work is used, a citation of the following work is necessary:
-Hörst, F., Rempe, M., Heine, L., Seibold, C., Keyl, J., Baldini, G., Ugurel, S., Siveke, J., Grünwald, B., Egger, J., & Kleesiek, J. (2023). CellViT: Vision Transformers for precise cell segmentation and classification. https://doi.org/10.48550/ARXIV.2306.15350 
+Required Attribution:
+If any part of this work is used, a citation of the following work is necessary:
+Hörst, F., Rempe, M., Heine, L., Seibold, C., Keyl, J., Baldini, G., Ugurel, S., Siveke, J., Grünwald, B., Egger, J., & Kleesiek, J. (2023). CellViT: Vision Transformers for precise cell segmentation and classification. https://doi.org/10.48550/ARXIV.2306.15350
 
-=======================================================================  
-APPENDIX A: Apache License 2.0  
+-----------------------------------------------------------------------
+4. Tissue-Context CellViT Extension
+
+Includes: Original contributions by Olena Kosharova as part of a bachelor's thesis
+at the Faculty of Informatics and Information Technologies, Slovak University of
+Technology in Bratislava (FIIT STU). This covers the extension of CellViT with a
+tissue-segmentation branch and multi-task fusion modules, the associated post-hoc
+tissue-compatibility constraint, the PanopTILs dataset loader, custom loss
+functions, the metrics aggregator, and the training/evaluation pipeline
+adaptations (all code not falling in (1), (2), or (3)).
+
+Copyright © 2025 Olena Kosharova, FIIT STU.
+
+License: Apache License 2.0, modified by the Commons Clause below:
+
+Commons Clause Restriction (Tissue-Context CellViT Extension)
+You may not sell, rent, or commercially exploit the Tissue-Context CellViT
+Extension without explicit written permission from Olena Kosharova.
+
+Required Attribution:
+If any part of this work is used, you must acknowledge:
+Kosharova, O. (2025). Integrating Cutting-Edge Computer Vision Techniques for
+Enhanced Histological Analysis and Precision Diagnostics in Modern Medicine.
+Bachelor's thesis, FIIT STU, Bratislava.
+
+=======================================================================
+APPENDIX A: Apache License 2.0
 
                                  Apache License  
                            Version 2.0, January 2004  
@@ -269,7 +293,7 @@ NOTICES AND ATTRIBUTIONS
 - Original Code:
   Copyright © 2024 Fabian Hörst, Jens Kleesiek.
 
-- PanopTILs Adaptations:
+- Tissue-Context CellViT Extension:
   Copyright © 2025 Olena Kosharova, FIIT STU.
 
 =======================================================================  
@@ -280,29 +304,7 @@ Component               | License                     | Key Restrictions
 SAM-Derivative          | Apache 2.0                  | None
 HIPT-Derivative         | Apache 2.0 + Commons Clause | No commercial sale without permission
 Original/Inference Code | Apache 2.0 + Commons Clause | No commercial sale; mandatory citation
-PanopTILs Adaptations   | Apache 2.0 + Commons Clause | Non-commercial, academic use; attribution required
+Tissue-Context Extension| Apache 2.0 + Commons Clause | No commercial sale; attribution required
 
 =======================================================================  
 By using this software, you agree to comply with all applicable terms.
-
-=======================================================================
-4. PanopTILs Adaptations
-
-Includes: Original contributions by Olena Kosharova as part of a bachelor's thesis
-at the Faculty of Informatics and Information Technologies, Slovak University of
-Technology in Bratislava (FIIT STU). This includes the PanopTILs dataset loader,
-custom loss functions, metrics aggregator, and training pipeline adaptations
-(all code not falling in (1), (2), or (3)).
-
-Copyright © 2025 Olena Kosharova, FIIT STU.
-
-License: Apache License 2.0, modified by the Commons Clause below:
-
-Commons Clause Restriction (PanopTILs Adaptations)
-You may not sell, rent, or commercially exploit the PanopTILs Adaptations without
-explicit written permission from Olena Kosharova.
-
-Required Attribution:
-If any part of this work is used, you must acknowledge:
-Kosharova, O. (2025). PanopTILs: CellViT-based segmentation and classification
-of tumor-infiltrating lymphocytes. Bachelor's thesis, FIIT STU, Bratislava.

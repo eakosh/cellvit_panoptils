@@ -1,3 +1,8 @@
+# Copyright © 2025 Olena Kosharova, FIIT STU.
+# Part of the "Tissue-Context CellViT Extension" (bachelor's thesis, FIIT STU).
+# Licensed under the Apache License 2.0 with the Commons Clause restriction.
+# See the LICENSE file in the project root for full terms.
+
 import numpy as np
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from scipy.optimize import linear_sum_assignment

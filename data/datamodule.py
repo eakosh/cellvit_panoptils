@@ -1,3 +1,8 @@
+# Copyright © 2025 Olena Kosharova, FIIT STU.
+# Part of the "Tissue-Context CellViT Extension" (bachelor's thesis, FIIT STU).
+# Licensed under the Apache License 2.0 with the Commons Clause restriction.
+# See the LICENSE file in the project root for full terms.
+
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
