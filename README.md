@@ -193,9 +193,3 @@ This project extends the following works:
 - **[HIPT](https://github.com/mahmoodlab/HIPT)** - Chen et al., 2022. Pre-trained ViT-S weights (vit256_small_dino.pth)
 - **[AFF](https://github.com/YimianDai/open-aff)** - Dai et al., 2021. Attentional Feature Fusion module
 - **[Segmentation Models PyTorch](https://github.com/qubvel-org/segmentation_models.pytorch)** - Yakubovskiy, 2019
-
-
----
-<div align="center">
-<sub>Bachelor's Thesis · Faculty of Informatics and Information Technologies, Slovak University of Technology · 2026</sub>
-</div>
